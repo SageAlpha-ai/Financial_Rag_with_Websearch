@@ -57,7 +57,7 @@ documents/
 *.pdf
 *.xlsx
 *.xls
-*.txt
+#*.txt
 
 # Temporary files
 *.tmp
@@ -73,3 +73,9 @@ temp/
 .github/workflows/*.yml.bak
 
 GIT_SETUP.md
+
+
+# Azure App Service runtime files (MUST be tracked)
+!runtime.txt
+!startup.txt
+!requirements.txt
