@@ -6,33 +6,15 @@ on:
       - main
   workflow_dispatch:
 
-env:
-  PYTHON_VERSION: '3.11'
-
 jobs:
-  build-and-deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      # Optional – keep this ONLY until deployment is stable
-      - name: Debug workspace
-        run: |
-          echo "Workspace root:"
-          pwd
-          echo "Files:"
-          ls -la
-          echo "requirements.txt:"
-          ls -la requirements.txt
-
-      - name: Deploy to Azure Web App
+      - name: Deploy to Azure Web App (Publish Profile)
         uses: azure/webapps-deploy@v3
         with:
           app-name: Financial-rag-model
