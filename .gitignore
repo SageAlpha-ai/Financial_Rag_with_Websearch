@@ -71,3 +71,5 @@ temp/
 
 # GitHub Actions
 .github/workflows/*.yml.bak
+
+GIT_SETUP.md
