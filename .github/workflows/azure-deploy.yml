@@ -7,43 +7,34 @@ on:
   workflow_dispatch:
 
 env:
-  AZURE_WEBAPP_NAME: ${{ secrets.AZURE_WEBAPP_NAME }}
   PYTHON_VERSION: '3.11'
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-      
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-        
-    - name: Debug workspace
-      run: |
-        echo "Current directory:"
-        pwd
-        echo "Workspace contents:"
-        ls -la
-        echo "Looking for requirements.txt:"
-        ls -la requirements.txt || echo "requirements.txt not found in current dir"
-        echo "Absolute path check:"
-        ls -la $GITHUB_WORKSPACE/requirements.txt || echo "requirements.txt not found at workspace root"
-        
-    - name: Install dependencies
-      run: |
-        python -m venv antenv
-        source antenv/bin/activate
-        python -m pip install --upgrade pip
-        python -m pip install -r $GITHUB_WORKSPACE/requirements.txt
-        
-    - name: Deploy to Azure Web App
-      uses: azure/webapps-deploy@v3
-      with:
-        app-name: ${{ env.AZURE_WEBAPP_NAME }}
-        publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-        package: .
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # Optional – keep this ONLY until deployment is stable
+      - name: Debug workspace
+        run: |
+          echo "Workspace root:"
+          pwd
+          echo "Files:"
+          ls -la
+          echo "requirements.txt:"
+          ls -la requirements.txt
+
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: Financial-rag-model
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: .
