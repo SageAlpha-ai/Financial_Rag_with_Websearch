@@ -35,7 +35,7 @@ class WebSearchEngine:
         Args:
             api_key: SerpApi API key (defaults to SERP_API env var)
         """
-        self.api_key = api_key or os.getenv("SERP_API_KEY") or os.getenv("SERP_API")
+        self.api_key = api_key or os.getenv("SERP_API_KEY")
         if not self.api_key:
             logger.warning("SerpApi key not found. Web search will be disabled.")
             self.enabled = False

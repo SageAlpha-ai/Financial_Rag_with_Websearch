@@ -175,23 +175,79 @@ def get_collection(
     
     Returns:
         Chroma Collection object
+    
+    Raises:
+        ValueError: If collection doesn't exist and create_if_missing is False
     """
+    import os
+    import logging
+    
+    logger = logging.getLogger(__name__)
     client = get_chroma_client()
     config = get_config().chroma_cloud
     
     collection_name = name or config.collection_name
     
-    if create_if_missing:
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-    else:
-        collection = client.get_collection(name=collection_name)
+    # Check if auto-creation is enabled via environment variable
+    # Default: auto-create in development, strict in production
+    auto_create_env = os.getenv("CHROMA_AUTO_CREATE_COLLECTION", "").lower()
+    is_production = os.getenv("PYTHON_ENV") == "production" or os.getenv("AZURE_APP_SERVICE")
     
-    print(f"Collection: {collection_name} ({collection.count()} documents)")
+    if auto_create_env == "true":
+        create_if_missing = True
+    elif auto_create_env == "false":
+        create_if_missing = False
+    elif not auto_create_env and not is_production:
+        # Development mode: auto-create by default
+        create_if_missing = True
+        logger.info("[CHROMA] Development mode: auto-creating collections if missing")
+    # If not set and production, use the parameter value (strict mode)
     
-    return collection
+    logger.info(f"[CHROMA] Getting collection: {collection_name}")
+    logger.info(f"[CHROMA] create_if_missing: {create_if_missing}")
+    
+    try:
+        if create_if_missing:
+            collection = client.get_or_create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            logger.info(f"[CHROMA] Collection '{collection_name}' ready (created or existing)")
+        else:
+            # Try to get existing collection
+            try:
+                collection = client.get_collection(name=collection_name)
+                logger.info(f"[CHROMA] Collection '{collection_name}' found")
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "not found" in error_msg or "does not exist" in error_msg:
+                    logger.error(f"[CHROMA] Collection '{collection_name}' does not exist")
+                    logger.error(f"[CHROMA] To auto-create collections, set CHROMA_AUTO_CREATE_COLLECTION=true")
+                    logger.error(f"[CHROMA] Or run ingestion: python ingest.py --fresh")
+                    raise ValueError(
+                        f"Chroma collection '{collection_name}' does not exist. "
+                        f"Please either:\n"
+                        f"  1. Set CHROMA_AUTO_CREATE_COLLECTION=true to auto-create empty collections, or\n"
+                        f"  2. Run ingestion to populate the collection: python ingest.py --fresh"
+                    ) from e
+                else:
+                    # Re-raise other errors
+                    raise
+        
+        doc_count = collection.count()
+        logger.info(f"[CHROMA] Collection '{collection_name}' has {doc_count} documents")
+        print(f"Collection: {collection_name} ({doc_count} documents)")
+        
+        return collection
+        
+    except ValueError:
+        # Re-raise ValueError (our custom errors)
+        raise
+    except Exception as e:
+        logger.error(f"[CHROMA] Failed to get collection '{collection_name}': {e}", exc_info=True)
+        raise ValueError(
+            f"Failed to access Chroma collection '{collection_name}': {str(e)}"
+        ) from e
 
 
 def get_chat_history_collection() -> Collection:

@@ -1,0 +1,54 @@
+services:
+  - type: web
+    name: financial-rag-api
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app -c gunicorn_config.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        fromService:
+          type: web
+          name: financial-rag-api
+          property: port
+      # Azure OpenAI Configuration
+      - key: AZURE_OPENAI_API_KEY
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_VERSION
+        value: 2024-12-01-preview
+      - key: AZURE_OPENAI_CHAT_DEPLOYMENT_NAME
+        sync: false
+      - key: AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME
+        sync: false
+      # Azure Blob Storage
+      - key: AZURE_STORAGE_CONNECTION_STRING
+        sync: false
+      - key: AZURE_BLOB_CONTAINER_NAME
+        sync: false
+      # SerpAPI
+      - key: SERP_API_KEY
+        sync: false
+      # Chroma Cloud
+      - key: CHROMA_HOST
+        value: api.trychroma.com
+      - key: CHROMA_API_KEY
+        sync: false
+      - key: CHROMA_TENANT
+        sync: false
+      - key: CHROMA_DATABASE
+        sync: false
+      - key: CHROMA_COLLECTION_NAME
+        value: compliance
+      # Optional: Auto-create Chroma collections in development
+      - key: CHROMA_AUTO_CREATE_COLLECTION
+        value: "true"
+      # Optional: API Key Authentication
+      - key: RAG_API_KEY
+        sync: false
+      # Optional: CORS
+      - key: CORS_ORIGINS
+        value: "*"

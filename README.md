@@ -21,9 +21,31 @@ This is a production-ready FastAPI-based RAG (Retrieval-Augmented Generation) se
 - 📊 **SageAlpha AI Branding** - Professional answer types and source formatting
 - ✅ **Never returns "Not available"** - Always provides an answer
 - 🌐 **RESTful API** - Ready for Node.js or any HTTP client
-- 🚀 **Auto-Deployment** - GitHub Actions → Azure App Service
+- 🚀 **Auto-Deployment** - Ready for Render.com, Azure App Service, and more
 
 ## Quick Start
+
+### 🚀 Deploy to Render (5 minutes)
+
+1. **Push to GitHub:**
+   ```bash
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git remote add origin https://github.com/YOUR_USERNAME/REPO_NAME.git
+   git push -u origin main
+   ```
+   See [GITHUB_SETUP.md](./GITHUB_SETUP.md) for detailed GitHub setup.
+
+2. **Deploy on Render:**
+   - Go to [render.com](https://render.com) and sign up
+   - Click "New +" → "Web Service"
+   - Connect your GitHub repository
+   - Add environment variables (see list below)
+   - Click "Create Web Service"
+   - Done! Your API will be live in 2-3 minutes 🎉
+
+**Full Guide:** [RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md)
 
 ### Local Development
 
@@ -61,8 +83,14 @@ This loads documents from Azure Blob Storage and local files, then embeds and st
 
 ### 4. Run the API Server
 
+**Development:**
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+**Production (with Gunicorn):**
+```bash
+gunicorn app:app -c gunicorn_config.py
 ```
 
 **Important**: `--host 0.0.0.0` is for server binding (allows external connections). Always use `http://localhost:8000` or `http://127.0.0.1:8000` in your browser - never use `0.0.0.0` in browser URLs.
@@ -135,9 +163,67 @@ GET /health
 
 ## Deployment
 
-### 🚀 Azure App Service (Recommended)
+### 🚀 Render.com (Recommended - Easy & Free)
 
-This project is configured for **automatic deployment to Azure App Service using GitHub Actions**.
+This project is ready for **one-click deployment on Render.com**.
+
+#### Quick Setup:
+
+1. **Push to GitHub:**
+   ```bash
+   git add .
+   git commit -m "Ready for Render deployment"
+   git push origin main
+   ```
+
+2. **Deploy on Render:**
+   - Go to [Render.com](https://render.com) and sign up/login
+   - Click "New +" → "Web Service"
+   - Connect your GitHub repository
+   - Render will auto-detect `render.yaml` configuration
+   - Add all environment variables (see below)
+   - Click "Create Web Service"
+
+3. **Required Environment Variables in Render:**
+   
+   **Azure OpenAI:**
+   - `AZURE_OPENAI_API_KEY` - Your Azure OpenAI API key
+   - `AZURE_OPENAI_ENDPOINT` - Your Azure OpenAI endpoint (e.g., `https://your-resource.openai.azure.com/`)
+   - `AZURE_OPENAI_API_VERSION` - API version (e.g., `2024-12-01-preview`)
+   - `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` - Chat deployment name (e.g., `gpt-4`)
+   - `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME` - Embeddings deployment name (e.g., `text-embedding-3-large`)
+   
+   **Azure Blob Storage:**
+   - `AZURE_STORAGE_CONNECTION_STRING` - Azure Blob Storage connection string
+   - `AZURE_BLOB_CONTAINER_NAME` - Container name
+   
+   **Chroma Cloud:**
+   - `CHROMA_API_KEY` - Chroma Cloud API key
+   - `CHROMA_TENANT` - Chroma Cloud tenant ID
+   - `CHROMA_DATABASE` - Chroma Cloud database name
+   - `CHROMA_COLLECTION_NAME` - Collection name (default: `compliance`)
+   
+   **SerpAPI (Optional):**
+   - `SERP_API_KEY` - SerpAPI key for web search
+   
+   **Optional:**
+   - `RAG_API_KEY` - API key for authentication (leave empty to disable)
+   - `CHROMA_AUTO_CREATE_COLLECTION` - Set to `true` to auto-create collections
+
+4. **After Deployment:**
+   - Your API will be available at: `https://your-app-name.onrender.com`
+   - Swagger UI: `https://your-app-name.onrender.com/docs`
+   - Run ingestion: Connect via SSH or use Render Shell to run `python ingest.py --fresh`
+
+**Render automatically:**
+- Detects Python 3.11 from `runtime.txt`
+- Uses `gunicorn_config.py` for production server
+- Handles PORT environment variable
+- Auto-deploys on git push to main branch
+
+### 🚀 Azure App Service (Alternative)
+
+This project is also configured for **automatic deployment to Azure App Service using GitHub Actions**.
 
 #### Quick Setup:
 
@@ -168,6 +254,7 @@ This project is configured for **automatic deployment to Azure App Service using
 ### Other Platforms
 
 The service can be deployed to any platform that supports Python:
+- **Render.com** (Recommended - Easy & Free) ✅ - See [RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md)
 - Azure App Service (via GitHub Actions) ✅
 - Docker (build your own Dockerfile)
 - AWS Elastic Beanstalk
@@ -194,8 +281,11 @@ The service can be deployed to any platform that supports Python:
 │   └── chroma_client.py
 ├── ingest.py             # Ingestion script
 ├── requirements.txt      # Python dependencies
-├── .env.example          # Environment template
-└── render.yaml           # Render deployment config
+├── runtime.txt           # Python version specification
+├── gunicorn_config.py    # Gunicorn production config
+├── Procfile              # Render/Heroku process file
+├── render.yaml           # Render deployment config
+└── .env.example          # Environment template
 ```
 
 ## Development
@@ -214,7 +304,7 @@ cp .env.example .env
 python ingest.py --fresh
 
 # Run API (use --host 0.0.0.0 for binding, but access via localhost in browser)
-uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 ### Testing
@@ -231,7 +321,8 @@ curl -X POST http://localhost:8000/query \
 
 ## 📚 Documentation
 
-- **[DEPLOYMENT_README.md](./DEPLOYMENT_README.md)** - Quick deployment guide
+- **[RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md)** - Complete Render.com deployment guide ⭐ **START HERE**
+- **[DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md)** - Deployment verification checklist
 - **[GITHUB_DEPLOYMENT_GUIDE.md](./GITHUB_DEPLOYMENT_GUIDE.md)** - Complete GitHub + Azure guide
 - **[AZURE_APP_SERVICE_DEPLOYMENT.md](./AZURE_APP_SERVICE_DEPLOYMENT.md)** - Detailed Azure setup
 - **[WEB_SEARCH_INTEGRATION.md](./WEB_SEARCH_INTEGRATION.md)** - Web search integration details

@@ -13,4 +13,4 @@ fi
 
 # Start the application
 # Azure App Service automatically sets PORT environment variable
-exec gunicorn api:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 300 --worker-class uvicorn.workers.UvicornWorker --access-logfile - --error-logfile -
+exec gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 300 --worker-class uvicorn.workers.UvicornWorker --access-logfile - --error-logfile -

@@ -79,3 +79,7 @@ GIT_SETUP.md
 !runtime.txt
 !startup.txt
 !requirements.txt
+
+# Render deployment files (MUST be tracked)
+!render.yaml
+!Procfile

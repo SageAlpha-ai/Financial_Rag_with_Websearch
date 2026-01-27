@@ -8,4 +8,4 @@ if "%PORT%"=="" set PORT=8000
 
 REM Start uvicorn with the app
 REM Note: Azure App Service requires binding to 0.0.0.0 and using the PORT variable
-uvicorn api:app --host 0.0.0.0 --port %PORT% --workers 1
+uvicorn app:app --host 0.0.0.0 --port %PORT% --workers 1

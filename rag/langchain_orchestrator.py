@@ -343,9 +343,21 @@ class LangChainOrchestrator:
         self.output_parser = StrOutputParser()
         
         # Get Chroma collection
-        self.collection = get_collection(create_if_missing=False)
+        # Use create_if_missing=False for strict mode (will raise ValueError if missing)
+        # This allows graceful error handling in the API layer
+        try:
+            self.collection = get_collection(create_if_missing=False)
+        except ValueError as e:
+            # Collection doesn't exist - this is a configuration issue
+            error_msg = str(e)
+            logger.error("=" * 60)
+            logger.error("CHROMADB COLLECTION ERROR")
+            logger.error("=" * 60)
+            logger.error(error_msg)
+            logger.error("=" * 60)
+            raise RuntimeError(error_msg) from e
         
-        # VERIFY ChromaDB is not empty (FAIL LOUDLY if empty)
+        # VERIFY ChromaDB is not empty (WARN but don't fail - allow LLM fallback)
         doc_count = self.collection.count()
         logger.info("=" * 60)
         logger.info("CHROMADB COLLECTION STATUS")
@@ -354,15 +366,16 @@ class LangChainOrchestrator:
         logger.info(f"Total embeddings: {doc_count}")
         
         if doc_count == 0:
-            error_msg = (
-                "FATAL ERROR: ChromaDB collection is EMPTY. "
+            warning_msg = (
+                "WARNING: ChromaDB collection is EMPTY. "
                 "No documents have been ingested. "
-                "Please run: python ingest.py --fresh"
+                "RAG queries will fall back to LLM-only answers. "
+                "To populate the collection, run: python ingest.py --fresh"
             )
-            logger.error("=" * 60)
-            logger.error(error_msg)
-            logger.error("=" * 60)
-            raise RuntimeError(error_msg)
+            logger.warning("=" * 60)
+            logger.warning(warning_msg)
+            logger.warning("=" * 60)
+            # Don't raise - allow the app to start and use LLM fallback
         
         logger.info("=" * 60)
         
@@ -688,6 +701,13 @@ Answer:"""
         5. Fuse evidence from RAG + Web
         6. Generate answer with trust-first guidelines
         """
+        # Initialize all variables with safe defaults to prevent UnboundLocalError
+        answer = ""
+        answer_type = "sagealpha_rag"
+        formatted_sources = []
+        rag_chain_executed = False
+        rag_chain_error = None
+        
         try:
             logger.info("[QUERY] Processing query")
             logger.info(f"[QUERY] Query text: {question}")
@@ -771,14 +791,19 @@ Answer:"""
                     }
                 
                 # Only allow LLM for non-factual queries (conceptual, general knowledge)
-                logger.info("[RAG] Non-factual query - allowing LLM fallback")
+                logger.warning("=" * 60)
+                logger.warning("[RESPONSE TYPE] LLM FALLBACK (No RAG documents available)")
+                logger.warning("=" * 60)
+                logger.warning("No documents retrieved from ChromaDB. Using LLM-only answer.")
+                logger.warning("To enable RAG answers, run: python ingest.py --fresh")
+                logger.warning("=" * 60)
                 answer = self.llm_only_chain.invoke({"question": question})
-                logger.info("[RAG] Answer generated")
+                logger.info("[LLM] Answer generated from general knowledge")
                 
                 # For non-factual queries, use sagealpha_rag (not LLM)
                 answer_type = "sagealpha_rag"
-                logger.info(f"[RESPONSE] answer_type={answer_type}")
-                logger.info("[RESPONSE] Returning answer to user")
+                logger.info(f"[RESPONSE] answer_type={answer_type} (LLM fallback, no sources)")
+                logger.info("[RESPONSE] Returning LLM-only answer to user")
                 
                 # For LLM answers, create a source indicating it's from general knowledge
                 llm_sources = [{
@@ -873,50 +898,144 @@ Answer:"""
             # STEP 6: Generate answer using fused context
             logger.info("[RAG] Sending fused context + query to LLM")
             
-            if fused_context:
-                answer = self.rag_chain.invoke({"question": question, "context": fused_context})
-            else:
-                # Fallback if fusion failed
-                context_parts = []
-                for doc, meta in zip(documents, metadatas):
-                    meta_info = ""
-                    if meta.get("source"):
-                        meta_info = f"Source: {meta.get('source')}"
-                    if meta.get("fiscal_year"):
-                        meta_info += f", FY: {meta.get('fiscal_year')}"
-                    if meta.get("page"):
-                        meta_info += f", Page: {meta.get('page')}"
-                    if meta_info:
-                        context_parts.append(f"[{meta_info}]\n{doc}")
-                    else:
-                        context_parts.append(doc)
+            # Track whether RAG chain actually executed successfully
+            # (rag_chain_executed already initialized at function start)
+            
+            try:
+                if fused_context:
+                    answer = self.rag_chain.invoke({"question": question, "context": fused_context})
+                else:
+                    # Fallback if fusion failed
+                    context_parts = []
+                    for doc, meta in zip(documents, metadatas):
+                        meta_info = ""
+                        if meta.get("source"):
+                            meta_info = f"Source: {meta.get('source')}"
+                        if meta.get("fiscal_year"):
+                            meta_info += f", FY: {meta.get('fiscal_year')}"
+                        if meta.get("page"):
+                            meta_info += f", Page: {meta.get('page')}"
+                        if meta_info:
+                            context_parts.append(f"[{meta_info}]\n{doc}")
+                        else:
+                            context_parts.append(doc)
+                    
+                    fused_context = "\n\n---\n\n".join(context_parts)
+                    answer = self.rag_chain.invoke({"question": question, "context": fused_context})
                 
-                fused_context = "\n\n---\n\n".join(context_parts)
-                answer = self.rag_chain.invoke({"question": question, "context": fused_context})
+                rag_chain_executed = True
+                logger.info("[RAG] Answer generated from retrieved documents")
+                
+            except Exception as rag_error:
+                rag_chain_error = rag_error
+                error_msg = str(rag_error)
+                
+                # Get config for error messages
+                config = get_config()
+                
+                logger.error("=" * 60)
+                logger.error("[RAG CHAIN] FAILED - Azure OpenAI deployment error")
+                logger.error("=" * 60)
+                logger.error(f"Error type: {type(rag_error).__name__}")
+                logger.error(f"Error message: {error_msg}")
+                
+                # Check if it's a deployment error
+                if "NotFound" in error_msg or "404" in error_msg or "deployment" in error_msg.lower():
+                    logger.error("This is an Azure OpenAI deployment configuration error.")
+                    logger.error(f"Chat deployment '{config.azure_openai.chat_deployment}' may not exist.")
+                    logger.error("Check Azure Portal → Deployments to verify the deployment name.")
+                
+                logger.error("=" * 60)
+                logger.error("Falling back to LLM-only mode (no RAG context)")
+                logger.error("=" * 60)
+                
+                # Fallback to LLM-only (but we still have documents, so this is a generation failure)
+                try:
+                    answer = self.llm_only_chain.invoke({"question": question})
+                    logger.warning("[FALLBACK] LLM-only answer generated (RAG chain failed)")
+                except Exception as llm_error:
+                    # Even LLM fallback failed - this is a critical error
+                    logger.error(f"[CRITICAL] LLM fallback also failed: {llm_error}")
+                    raise RuntimeError(
+                        f"Both RAG and LLM generation failed. "
+                        f"RAG error: {rag_error}, LLM error: {llm_error}"
+                    ) from llm_error
             
-            logger.info("[RAG] Answer generated")
+            # Get config for answer type determination (needed for error messages)
+            config = get_config()
             
-            # Determine answer type based on sources (STRICT: No LLM type allowed)
-            # ABSOLUTE RULE: Only allow sagealpha_rag, sagealpha_ai_search, or sagealpha_hybrid_search
-            if web_documents and documents:
-                answer_type = "sagealpha_hybrid_search"
-                logger.info("[ANSWER_TYPE] Hybrid search: RAG + Web Search")
-            elif web_documents:
-                answer_type = "sagealpha_ai_search"
-                logger.info("[ANSWER_TYPE] Web search only")
-            elif documents:
-                answer_type = "sagealpha_rag"
-                logger.info("[ANSWER_TYPE] RAG from internal documents")
+            # Determine answer type based on whether RAG chain executed AND what sources we have
+            # CRITICAL: answer_type reflects HOW the answer was generated, not just source count
+            # If RAG chain executed successfully, it's RAG (even if sources are empty)
+            # If RAG chain failed, we still label based on documents retrieved (but log the failure)
+            
+            if rag_chain_executed:
+                # RAG chain succeeded - this is a true RAG answer
+                if web_documents and documents:
+                    answer_type = "sagealpha_hybrid_search"
+                    logger.info("=" * 60)
+                    logger.info("[RESPONSE TYPE] HYBRID SEARCH (RAG + Web Search)")
+                    logger.info("=" * 60)
+                    logger.info(f"✓ RAG chain executed successfully")
+                    logger.info(f"Using {len(documents)} RAG documents + {len(web_documents)} web documents")
+                    logger.info("=" * 60)
+                elif web_documents:
+                    answer_type = "sagealpha_ai_search"
+                    logger.info("=" * 60)
+                    logger.info("[RESPONSE TYPE] WEB SEARCH ONLY")
+                    logger.info("=" * 60)
+                    logger.info(f"✓ RAG chain executed successfully")
+                    logger.info(f"Using {len(web_documents)} web documents (no RAG documents found)")
+                    logger.info("=" * 60)
+                elif documents:
+                    answer_type = "sagealpha_rag"
+                    logger.info("=" * 60)
+                    logger.info("[RESPONSE TYPE] RAG (Internal Documents)")
+                    logger.info("=" * 60)
+                    logger.info(f"✓ RAG chain executed successfully")
+                    logger.info(f"Using {len(documents)} documents from ChromaDB")
+                    logger.info("=" * 60)
+                else:
+                    # RAG executed but no documents - this shouldn't happen but handle it
+                    answer_type = "sagealpha_rag"
+                    logger.warning("[RESPONSE TYPE] RAG executed but no documents (unexpected)")
             else:
-                # This should never happen due to evidence gate above, but safety check
-                logger.error("[ANSWER_TYPE] ERROR: No documents but reached answer generation - this should be blocked")
-                answer_type = "sagealpha_ai_search"  # Use search type, never LLM
-            
-            logger.info(f"[RESPONSE] answer_type={answer_type}")
-            logger.info("[RESPONSE] Returning answer to user")
+                # RAG chain failed - we fell back to LLM-only
+                # BUT: We still have documents, so this is a generation failure, not a retrieval failure
+                # We label based on what documents we retrieved (to show we tried RAG)
+                if documents or web_documents:
+                    # We have documents but RAG generation failed - still label as RAG type (with warning)
+                    if web_documents and documents:
+                        answer_type = "sagealpha_hybrid_search"
+                    elif web_documents:
+                        answer_type = "sagealpha_ai_search"
+                    else:
+                        answer_type = "sagealpha_rag"
+                    
+                    logger.warning("=" * 60)
+                    logger.warning(f"[RESPONSE TYPE] {answer_type.upper()} (RAG GENERATION FAILED - LLM FALLBACK)")
+                    logger.warning("=" * 60)
+                    logger.warning(f"⚠ Documents retrieved ({len(documents)} RAG + {len(web_documents)} web)")
+                    logger.warning(f"⚠ But RAG chain failed - using LLM-only answer")
+                    logger.warning(f"⚠ This indicates Azure OpenAI deployment configuration issue")
+                    logger.warning(f"⚠ Check: AZURE_OPENAI_CHAT_DEPLOYMENT_NAME={config.azure_openai.chat_deployment}")
+                    logger.warning("=" * 60)
+                else:
+                    # No documents AND RAG failed - this is a true LLM fallback
+                    answer_type = "sagealpha_rag"  # Still use RAG branding for consistency
+                    logger.warning("=" * 60)
+                    logger.warning("[RESPONSE TYPE] LLM FALLBACK (No documents + RAG failed)")
+                    logger.warning("=" * 60)
+                    logger.warning("No documents retrieved and RAG chain failed")
+                    logger.warning("=" * 60)
             
             # Format sources using SourceFormatter (hides internal paths, shows official URLs)
+            # (formatted_sources already initialized at function start, but we'll set it here)
             formatted_sources = SourceFormatter.format_sources(metadatas, web_documents)
+            
+            logger.info(f"[RESPONSE] answer_type={answer_type}")
+            logger.info(f"[RESPONSE] sources_count={len(formatted_sources) if formatted_sources else 0}")
+            logger.info("[RESPONSE] Returning answer to user")
             
             # CRITICAL: Ensure sources are never null/empty for RAG answers
             if not formatted_sources:
@@ -962,14 +1081,42 @@ Answer:"""
 
 # Singleton instance
 _orchestrator: Optional[LangChainOrchestrator] = None
+_orchestrator_error: Optional[str] = None
 
 
 def get_orchestrator() -> LangChainOrchestrator:
     """Get singleton orchestrator instance."""
-    global _orchestrator
-    if _orchestrator is None:
+    global _orchestrator, _orchestrator_error
+    
+    if _orchestrator is not None:
+        return _orchestrator
+    
+    if _orchestrator_error is not None:
+        raise RuntimeError(f"Orchestrator initialization failed previously: {_orchestrator_error}")
+    
+    try:
+        logger.info("[ORCHESTRATOR] Initializing LangChain orchestrator...")
         _orchestrator = LangChainOrchestrator()
-    return _orchestrator
+        logger.info("[ORCHESTRATOR] Orchestrator initialized successfully")
+        return _orchestrator
+    except RuntimeError as e:
+        # ChromaDB empty or fatal errors
+        error_msg = str(e)
+        _orchestrator_error = error_msg
+        logger.error(f"[ORCHESTRATOR] Initialization failed: {error_msg}")
+        raise
+    except ValueError as e:
+        # Configuration errors
+        error_msg = str(e)
+        _orchestrator_error = error_msg
+        logger.error(f"[ORCHESTRATOR] Configuration error: {error_msg}")
+        raise
+    except Exception as e:
+        # Other initialization errors
+        error_msg = str(e)
+        _orchestrator_error = error_msg
+        logger.error(f"[ORCHESTRATOR] Unexpected initialization error: {error_msg}", exc_info=True)
+        raise RuntimeError(f"Failed to initialize orchestrator: {error_msg}") from e
 
 
 def answer_query_simple(question: str) -> Dict[str, Any]:
@@ -978,5 +1125,30 @@ def answer_query_simple(question: str) -> Dict[str, Any]:
     
     Uses OpenAI-style answerability validation with automatic LLM fallback.
     """
-    orchestrator = get_orchestrator()
-    return orchestrator.answer_query(question)
+    try:
+        orchestrator = get_orchestrator()
+        return orchestrator.answer_query(question)
+    except RuntimeError as e:
+        # Handle initialization errors
+        error_msg = str(e)
+        logger.error(f"[API] Orchestrator error: {error_msg}")
+        
+        # Return a user-friendly error response
+        if "ChromaDB collection is EMPTY" in error_msg or "FATAL ERROR" in error_msg:
+            return {
+                "answer": "The knowledge base is not available. Please ensure documents have been ingested by running the ingestion process.",
+                "answer_type": "sagealpha_rag",
+                "sources": []
+            }
+        elif "CHROMA_API_KEY" in error_msg or "environment variable" in error_msg:
+            return {
+                "answer": "Service configuration error. Please check that all required environment variables are set correctly.",
+                "answer_type": "sagealpha_rag",
+                "sources": []
+            }
+        else:
+            return {
+                "answer": f"I apologize, but I encountered an error while initializing the system: {error_msg}. Please contact support.",
+                "answer_type": "sagealpha_rag",
+                "sources": []
+            }

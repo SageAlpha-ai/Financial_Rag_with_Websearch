@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from typing import Optional
 
 # Only load .env in development (not in production)
-# In production (Render), all config comes from environment variables
-if os.getenv("RENDER") is None and os.getenv("PYTHON_ENV") != "production":
+# In production (Azure App Service), all config comes from environment variables
+if os.getenv("AZURE_APP_SERVICE") is None and os.getenv("PYTHON_ENV") != "production":
     try:
         from dotenv import load_dotenv
         load_dotenv()
