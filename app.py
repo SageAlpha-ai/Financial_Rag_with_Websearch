@@ -43,6 +43,122 @@ logger = logging.getLogger(__name__)
 # Input Normalization
 # ================================
 
+def sanitize_llm_input(user_input: str) -> str:
+    """
+    Sanitize user input for LLM-only queries to prevent Azure jailbreak detection.
+    
+    Removes instruction-style or system-directive language that triggers Azure content filters.
+    Preserves user intent while making the query safe for Azure OpenAI.
+    
+    Args:
+        user_input: User query that may contain instruction-style language
+        
+    Returns:
+        Sanitized query safe for Azure OpenAI
+    """
+    import re
+    
+    if not user_input:
+        return ""
+    
+    original = user_input.strip()
+    sanitized = original
+    
+    # Detect if input contains instruction-style language
+    jailbreak_keywords = [
+        'operating in', 'llm-only', 'external context', 'retrieval results',
+        'must be ignored', 'must be treated', 'use only your', 'internal knowledge',
+        'ignore documents', 'ignore context', 'ignore retrieval', 'ignore external',
+        'treat as empty', 'bypass', 'override', 'disable', 'do not use',
+        'all external', 'any external', 'every external'
+    ]
+    
+    has_jailbreak_language = any(keyword in original.lower() for keyword in jailbreak_keywords)
+    
+    if not has_jailbreak_language:
+        # No jailbreak language detected, return as-is
+        return original
+    
+    # Patterns that trigger Azure jailbreak detection (multiline-aware)
+    jailbreak_patterns = [
+        # System directive patterns (match across lines)
+        (r'you\s+are\s+operating\s+in\s+[^\n]*?mode[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'all\s+external\s+context[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'retrieval\s+results[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'documents\s+must\s+be\s+(ignored|treated|avoided|disregarded)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'(all\s+)?documents\s+(must\s+be\s+)?(ignored|treated|avoided)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'use\s+only\s+your\s+(internal\s+)?knowledge[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'ignore\s+(all\s+)?(documents|context|retrieval|external)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'treat\s+(retrieved|external|context)[^\n]*?as\s+empty[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'avoid\s+(buy|sell|trading|investment)\s+instructions[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'do\s+not\s+use\s+(documents|context|retrieval)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'bypass\s+(rag|retrieval|documents)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'override\s+(system|rag|retrieval)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'disable\s+(rag|retrieval|documents)[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'operate\s+outside\s+[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+        (r'act\s+as\s+if\s+[^\n]*?\.?\s*', '', re.IGNORECASE | re.DOTALL),
+    ]
+    
+    # Remove jailbreak patterns
+    for pattern, replacement, flags in jailbreak_patterns:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=flags)
+    
+    # Remove instruction-style sentence starters (line-by-line)
+    lines = sanitized.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Remove instruction starters
+        line = re.sub(r'^(you\s+are|you\s+must|you\s+should|you\s+need\s+to|you\s+cannot|you\s+shall)\s+', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'^(ignore|bypass|override|disable|avoid|treat)\s+', '', line, flags=re.IGNORECASE)
+        line = re.sub(r'^(all|any|every)\s+(external|retrieved|document|context)\s+', '', line, flags=re.IGNORECASE)
+        
+        # Skip lines that are purely instructions
+        if line and not any(keyword in line.lower() for keyword in ['ignore', 'bypass', 'override', 'disable', 'operating', 'must be', 'treat as']):
+            cleaned_lines.append(line)
+    
+    sanitized = ' '.join(cleaned_lines)
+    
+    # Clean up multiple spaces
+    sanitized = re.sub(r'\s+', ' ', sanitized)
+    sanitized = sanitized.strip()
+    
+    # If sanitization removed everything meaningful, extract the core question
+    if len(sanitized) < 10 or not sanitized:
+        # Check if entire input was instruction-style
+        instruction_ratio = sum(1 for keyword in jailbreak_keywords if keyword in original.lower()) / max(len(jailbreak_keywords), 1)
+        
+        if instruction_ratio > 0.3:  # More than 30% of keywords found - likely pure instructions
+            # Entire input is instructions - return safe generic query
+            sanitized = "Please provide your question or topic of interest."
+        else:
+            # Try to extract a question from the original input
+            question_match = re.search(r'(what|how|why|when|where|who|explain|describe|tell\s+me|can\s+you|please)[^.]*[?.]?', original, re.IGNORECASE)
+            if question_match:
+                sanitized = question_match.group(0).strip()
+            else:
+                # Fallback: use first sentence that doesn't contain jailbreak keywords
+                sentences = re.split(r'[.!?]\s+', original)
+                for sentence in sentences:
+                    sentence_clean = sentence.strip()
+                    if len(sentence_clean) > 5 and not any(keyword in sentence_clean.lower() for keyword in jailbreak_keywords):
+                        sanitized = sentence_clean
+                        break
+                if not sanitized or len(sanitized) < 5:
+                    # Last resort: return a generic query
+                    sanitized = "Please provide your question or topic of interest."
+    
+    # Final cleanup
+    sanitized = sanitized.strip()
+    if not sanitized or len(sanitized) < 3:
+        return "Please provide your question."
+    
+    return sanitized
+
+
 def normalize_user_input(raw_input: str) -> str:
     """
     Normalize and sanitize raw user input.
@@ -292,13 +408,19 @@ def validate_azure_openai_deployments(config) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
+    # Detect runtime environment
+    is_docker = os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER") == "true"
+    is_production = os.getenv("AZURE_APP_SERVICE") is not None or os.getenv("PYTHON_ENV") == "production"
+    fail_fast = is_docker or is_production
+    
     # Startup
     try:
+        # Load and validate configuration (will raise ValueError if required vars missing)
         config = get_config()
         validate_config(config)
-        logger.info("Configuration loaded successfully")
+        logger.info("Configuration loaded and validated successfully")
         
-        # Validate Azure OpenAI deployments (fail fast if misconfigured)
+        # Validate Azure OpenAI deployments (fail fast in Docker/production)
         try:
             validate_azure_openai_deployments(config)
         except ValueError as e:
@@ -307,13 +429,17 @@ async def lifespan(app: FastAPI):
             logger.error("=" * 60)
             logger.error(str(e))
             logger.error("=" * 60)
-            logger.error("The application will not function correctly until deployments are fixed.")
-            # Don't crash - allow health checks, but log clearly
+            if fail_fast:
+                logger.error("CRITICAL ERROR: Application cannot start in Docker/production without valid Azure OpenAI configuration.")
+                logger.error("=" * 60)
+                raise  # Fail fast in Docker/production
+            else:
+                logger.error("The application will not function correctly until deployments are fixed.")
+                # Allow health checks in local dev only
         
         # Validate Chroma collection (non-blocking)
         try:
             from vectorstore.chroma_client import get_collection
-            import os
             
             # Auto-create in development mode
             is_production = os.getenv("PYTHON_ENV") == "production" or os.getenv("AZURE_APP_SERVICE")
@@ -348,12 +474,22 @@ async def lifespan(app: FastAPI):
             logger.warning("Queries may fail if collection is not available.")
         
     except ValueError as e:
-        # Log error but don't crash - app can still serve health checks
-        logger.error(f"CRITICAL CONFIGURATION ERROR: {e}")
-        logger.error("The application may not function correctly until environment variables are set.")
-    
-    # Get port from environment (Azure App Service uses PORT, local dev uses 8000)
-    port = int(os.getenv("PORT", "8000"))
+        # Configuration error - fail fast with clear message
+        logger.error("=" * 60)
+        logger.error("CRITICAL CONFIGURATION ERROR - APPLICATION CANNOT START")
+        logger.error("=" * 60)
+        logger.error(str(e))
+        logger.error("")
+        logger.error("Required environment variables are missing.")
+        logger.error("")
+        logger.error("For Docker, use:")
+        logger.error("  docker run --env-file .env <image>")
+        logger.error("")
+        logger.error("For Azure App Service, set variables in:")
+        logger.error("  Configuration → Application settings")
+        logger.error("=" * 60)
+        # Re-raise to prevent app from starting with invalid config
+        raise
     
     logger.info("=" * 60)
     logger.info("AI RAG SERVICE STARTED")
@@ -363,7 +499,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("API Key authentication: DISABLED")
     logger.info("=" * 60)
-    logger.info(f"Server is running. Open http://localhost:{port}/docs in your browser")
+    logger.info("Server is running. Access API documentation at /docs")
     logger.info("=" * 60)
     
     yield  # App runs here
@@ -514,15 +650,52 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         
         logger.info(f"[API] Processing query: {normalized_input[:100]}...")
         
-        # Route based on intent: report generation vs Q&A
+        # STEP 1: Classify query intent BEFORE routing
+        from rag.query_classifier import QueryClassifier
+        query_classification = QueryClassifier.classify_query(normalized_input)
+        intent = query_classification.get("intent", "financial_document_query")
+        
+        logger.info(f"[API] Query intent: {intent}")
+        
+        # STEP 2: Route based on intent
         try:
-            if is_report_request(normalized_input):
+            if intent == "greeting":
+                # Greetings - use LLM-only WITHOUT RAG initialization
+                logger.info("[API] Greeting detected - using LLM-only mode (no RAG initialization)")
+                # Sanitize input to prevent Azure jailbreak detection
+                sanitized_input = sanitize_llm_input(normalized_input)
+                if sanitized_input != normalized_input:
+                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
+                from rag.langchain_orchestrator import get_llm_only_chain
+                llm_chain = get_llm_only_chain()
+                answer = llm_chain.invoke({"question": sanitized_input})
+                result = {
+                    "answer": answer,
+                    "answer_type": "llm_fallback",
+                    "sources": []
+                }
+            elif intent == "general_knowledge":
+                # General knowledge - use LLM-only WITHOUT RAG initialization
+                logger.info("[API] General knowledge query - using LLM-only mode (no RAG initialization)")
+                # Sanitize input to prevent Azure jailbreak detection
+                sanitized_input = sanitize_llm_input(normalized_input)
+                if sanitized_input != normalized_input:
+                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
+                from rag.langchain_orchestrator import get_llm_only_chain
+                llm_chain = get_llm_only_chain()
+                answer = llm_chain.invoke({"question": sanitized_input})
+                result = {
+                    "answer": answer,
+                    "answer_type": "llm_fallback",
+                    "sources": []
+                }
+            elif is_report_request(normalized_input):
                 # Long-format report generation (two-phase: RAG facts + LLM narrative)
                 logger.info("[API] Report generation mode detected")
                 result = generate_report(normalized_input)
             else:
-                # Standard Q&A mode (existing behavior)
-                logger.info("[API] Standard Q&A mode - calling answer_query_simple")
+                # Financial document query - use RAG pipeline
+                logger.info("[API] Financial document query - using RAG pipeline")
                 result = answer_query_simple(normalized_input)
             
             # Validate result structure

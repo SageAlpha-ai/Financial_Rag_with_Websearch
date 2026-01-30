@@ -1,0 +1,57 @@
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+
+# Virtual environments
+venv
+env
+ENV
+.venv
+
+# Environment variables
+.env
+.env.*
+.env.local
+.env.example
+
+# Git
+.git
+.gitignore
+.github
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Azure
+.azure
+
+# Documentation (optional - remove if you want docs in image)
+*.md
+!README.md
+
+# Deployment files (not needed in container)
+Procfile
+render.yaml
+startup.sh
+startup.bat
+startup.txt
+runtime.txt
+
+# Test files (optional - remove if you want tests in image)
+tests
+test_*.py
+*_test.py

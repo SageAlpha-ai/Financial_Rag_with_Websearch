@@ -413,51 +413,44 @@ class LangChainOrchestrator:
     def _setup_chains(self):
         """Setup LangChain prompts and LCEL chains."""
         
-        # RAG prompt (strict document-based answers with trust-first guidelines)
-        self.rag_template = """You are SageAlpha AI, an enterprise-grade Financial & Regulatory AI assistant designed for high factual accuracy, zero hallucination, and audit-ready answers.
+        # RAG prompt (Azure-safe, strict document-based answers)
+        self.rag_template = """You are a financial compliance assistant.
 
-Your goal is to answer user questions by combining multiple sources of truth, in strict priority order:
-1. Official company documents (from web search - highest priority)
-2. Internal RAG knowledge (ChromaDB embeddings from curated documents)
-3. LLM reasoning and summarization, strictly grounded in retrieved evidence
+Answer the question using only the information provided in the context below.
 
 Context documents:
 {context}
 
 Question: {question}
 
-STRICT INSTRUCTIONS:
-- Answer using ONLY information from the provided context documents
-- Include specific numbers, dates, and facts EXACTLY as they appear in the context
-- Preserve exact numeric values (integers, floats, percentages, currency)
-- If an exact number is not found in the context, say: "The exact value is not available in the official documents reviewed."
-- NEVER estimate, approximate, or hallucinate numbers
-- NEVER invent facts, numbers, or sources
-- Cite official sources when referencing specific data
-- If data is unavailable, say so clearly: "Based on the available official sources, this information could not be verified."
-
-SOURCE REQUIREMENTS:
-- Every factual answer MUST include official source identification
-- For web-retrieved documents, cite the official company website URL
-- For internal documents, cite the document name and page number
-- Do NOT expose internal storage paths (Azure Blob, local temp paths)
+Guidelines:
+- Use information from the context documents to answer the question.
+- Include specific numbers, dates, and facts exactly as they appear in the context.
+- Preserve exact numeric values without modification.
+- If the answer is explicitly present in the context, state it clearly.
+- If the answer is not present in the context, respond exactly with: "This information is not available in the internal documents."
+- Cite sources when referencing specific data from the context.
+- For web documents, cite the official company website URL.
+- For internal documents, cite the document name and page number if available.
 
 Answer:"""
         
         self.rag_prompt = ChatPromptTemplate.from_template(self.rag_template)
         self.rag_chain = self.rag_prompt | self.llm | self.output_parser
         
-        # LLM-only prompt (general knowledge with source attribution)
-        self.llm_only_template = """You are SageAlpha AI, a financial AI assistant. Answer the question using your knowledge.
+        # LLM-only prompt (Azure-safe, general knowledge)
+        self.llm_only_template = """You are a general financial assistant.
+
+Respond naturally and conversationally to the user's question.
 
 Question: {question}
 
-Answer the question helpfully and accurately. For financial queries, be precise with numbers and dates when you have that information.
-
-IMPORTANT: At the end of your answer, include a note about the source of your information. For example:
-- "This information is based on publicly available financial data and company filings."
-- "This answer is derived from general knowledge about the company's financial performance."
-- "This information may be found in the company's annual reports or SEC filings."
+Guidelines:
+- Use your general knowledge to provide helpful information.
+- Respond in a clear and educational manner.
+- If exact figures or current values are unavailable, state that values may be approximate.
+- Provide educational information only.
+- Do not give personalized or binding financial advice.
 
 Answer:"""
         
@@ -741,6 +734,7 @@ Answer:"""
             # Get similarity scores for decision logic (distances from ChromaDB)
             # Note: ChromaDB returns distances (lower = more similar), not similarity scores
             similarity_scores = []
+            max_distance = 1.0  # Threshold for confidence gating (lower = more strict)
             if documents:
                 # Get distances from the retrieval we just did
                 try:
@@ -750,10 +744,52 @@ Answer:"""
                         include=["distances"]
                     )
                     similarity_scores = chroma_results.get("distances", [[]])[0] if chroma_results.get("distances") else []
+                    if similarity_scores:
+                        max_distance = max(similarity_scores[:len(documents)])  # Get max distance for retrieved docs
                 except:
                     similarity_scores = []
             
             logger.info(f"[DEBUG] Retrieved docs count: {len(documents)}")
+            if similarity_scores:
+                logger.info(f"[DEBUG] Max similarity distance: {max_distance:.4f} (lower = more similar)")
+            
+            # RETRIEVAL CONFIDENCE GATING: Skip RAG if no documents OR low confidence
+            # ChromaDB distances: lower = more similar, typical range 0.0-2.0
+            # Threshold: 1.5 means only very similar documents are used
+            retrieval_confidence_threshold = 1.5  # Distance threshold (lower = more strict)
+            has_high_confidence = len(documents) > 0 and (not similarity_scores or max_distance < retrieval_confidence_threshold)
+            
+            if not documents:
+                # No documents retrieved - return safe message for financial queries
+                if requires_verified_source:
+                    logger.warning("=" * 60)
+                    logger.warning("[RETRIEVAL_GATE] BLOCKED: No documents retrieved for factual financial query")
+                    logger.warning("=" * 60)
+                    logger.warning("This information is not available in the internal documents.")
+                    logger.warning("=" * 60)
+                    
+                    return {
+                        "answer": "This information is not available in the internal documents.",
+                        "answer_type": "sagealpha_rag",
+                        "sources": []
+                    }
+            elif similarity_scores and max_distance >= retrieval_confidence_threshold:
+                # Documents retrieved but similarity is too low - return safe message
+                if requires_verified_source:
+                    logger.warning("=" * 60)
+                    logger.warning("[RETRIEVAL_GATE] BLOCKED: Low retrieval confidence")
+                    logger.warning("=" * 60)
+                    logger.warning(f"Documents retrieved: {len(documents)}")
+                    logger.warning(f"Max similarity distance: {max_distance:.4f} (threshold: {retrieval_confidence_threshold})")
+                    logger.warning("Retrieved documents are not sufficiently relevant to answer this query.")
+                    logger.warning("This information is not available in the internal documents.")
+                    logger.warning("=" * 60)
+                    
+                    return {
+                        "answer": "This information is not available in the internal documents.",
+                        "answer_type": "sagealpha_rag",
+                        "sources": []
+                    }
             
             # STEP 2: Decide if web search should be triggered
             web_documents = []
@@ -947,12 +983,14 @@ Answer:"""
                 
                 logger.error("=" * 60)
                 logger.error("Falling back to LLM-only mode (no RAG context)")
+                logger.error(f"Reason: RAG chain execution failed - {error_msg[:100]}")
                 logger.error("=" * 60)
                 
                 # Fallback to LLM-only (but we still have documents, so this is a generation failure)
                 try:
                     answer = self.llm_only_chain.invoke({"question": question})
                     logger.warning("[FALLBACK] LLM-only answer generated (RAG chain failed)")
+                    logger.warning(f"[FALLBACK] Mode: llm_fallback | Reason: RAG chain error - {type(rag_error).__name__}")
                 except Exception as llm_error:
                     # Even LLM fallback failed - this is a critical error
                     logger.error(f"[CRITICAL] LLM fallback also failed: {llm_error}")
@@ -1015,18 +1053,23 @@ Answer:"""
                     logger.warning("=" * 60)
                     logger.warning(f"[RESPONSE TYPE] {answer_type.upper()} (RAG GENERATION FAILED - LLM FALLBACK)")
                     logger.warning("=" * 60)
+                    logger.warning(f"Mode: llm_fallback")
+                    logger.warning(f"Reason: RAG chain execution failed despite documents being retrieved")
                     logger.warning(f"⚠ Documents retrieved ({len(documents)} RAG + {len(web_documents)} web)")
                     logger.warning(f"⚠ But RAG chain failed - using LLM-only answer")
                     logger.warning(f"⚠ This indicates Azure OpenAI deployment configuration issue")
                     logger.warning(f"⚠ Check: AZURE_OPENAI_CHAT_DEPLOYMENT_NAME={config.azure_openai.chat_deployment}")
+                    logger.warning(f"⚠ RAG error: {str(rag_chain_error)[:200] if rag_chain_error else 'Unknown'}")
                     logger.warning("=" * 60)
                 else:
                     # No documents AND RAG failed - this is a true LLM fallback
-                    answer_type = "sagealpha_rag"  # Still use RAG branding for consistency
+                    answer_type = "llm_fallback"
                     logger.warning("=" * 60)
                     logger.warning("[RESPONSE TYPE] LLM FALLBACK (No documents + RAG failed)")
                     logger.warning("=" * 60)
-                    logger.warning("No documents retrieved and RAG chain failed")
+                    logger.warning("Mode: llm_fallback")
+                    logger.warning(f"Reason: No documents retrieved AND RAG chain failed")
+                    logger.warning(f"RAG error: {str(rag_chain_error)[:200] if rag_chain_error else 'Unknown'}")
                     logger.warning("=" * 60)
             
             # Format sources using SourceFormatter (hides internal paths, shows official URLs)
@@ -1082,6 +1125,45 @@ Answer:"""
 # Singleton instance
 _orchestrator: Optional[LangChainOrchestrator] = None
 _orchestrator_error: Optional[str] = None
+
+
+def get_llm_only_chain():
+    """
+    Get lightweight LLM-only chain without initializing RAG components.
+    Use this for greetings and general knowledge queries.
+    """
+    from langchain_core.prompts import ChatPromptTemplate
+    from langchain_core.output_parsers import StrOutputParser
+    from config.settings import get_config
+    
+    config = get_config()
+    
+    # Create LLM instance (no RAG components)
+    llm = AzureChatOpenAI(
+        azure_endpoint=config.azure_openai.endpoint,
+        azure_deployment=config.azure_openai.chat_deployment,
+        api_key=config.azure_openai.api_key,
+        api_version=config.azure_openai.api_version,
+        temperature=0.0,
+    )
+    
+    # LLM-only prompt (Azure-safe, general knowledge)
+    llm_only_template = """You are a general financial assistant.
+
+Answer the user's question using your general knowledge.
+Keep responses clear and helpful.
+
+If exact or current figures are not available, say they may be approximate.
+Provide educational information only and avoid personalized financial advice.
+
+Question: {question}
+
+Answer:"""
+    
+    llm_only_prompt = ChatPromptTemplate.from_template(llm_only_template)
+    llm_only_chain = llm_only_prompt | llm | StrOutputParser()
+    
+    return llm_only_chain
 
 
 def get_orchestrator() -> LangChainOrchestrator:

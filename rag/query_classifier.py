@@ -12,7 +12,24 @@ logger = logging.getLogger(__name__)
 
 
 class QueryClassifier:
-    """Classifies queries to determine evidence requirements."""
+    """Classifies queries to determine evidence requirements and intent."""
+    
+    # Greeting patterns
+    GREETING_PATTERNS = [
+        r'^(hi|hello|hey|greetings|good morning|good afternoon|good evening|howdy)[\s!.,]*$',
+        r'^(hi|hello|hey)[\s,]+(there|everyone|all|guys)[\s!.,]*$',
+        r'^how\s+(are\s+you|do\s+you\s+do|is\s+it\s+going)[\s?.,]*$',
+        r'^what\'?s\s+up[\s?.,]*$',
+        r'^thanks?[\s!.,]*$',
+        r'^thank\s+you[\s!.,]*$',
+    ]
+    
+    # General knowledge indicators (not document-specific)
+    GENERAL_KNOWLEDGE_INDICATORS = [
+        "what is", "who is", "explain", "tell me about", "describe",
+        "how does", "how do", "what are", "define", "meaning of",
+        "difference between", "compare", "why is", "why are"
+    ]
     
     # Financial keywords that require verified sources
     FINANCIAL_KEYWORDS = [
@@ -39,19 +56,33 @@ class QueryClassifier:
     @staticmethod
     def classify_query(query: str) -> Dict[str, any]:
         """
-        Classify query to determine evidence requirements.
+        Classify query to determine intent and evidence requirements.
         
         Returns:
             {
+                "intent": "greeting" | "general_knowledge" | "financial_document_query",
                 "is_factual_financial": bool,
                 "requires_verified_source": bool,
                 "confidence": float,
                 "keywords_found": List[str]
             }
         """
-        query_lower = query.lower()
+        query_lower = query.lower().strip()
+        query_clean = re.sub(r'[^\w\s]', '', query_lower)
         
-        # Check for financial keywords
+        # STEP 1: Check for greetings (highest priority)
+        for pattern in QueryClassifier.GREETING_PATTERNS:
+            if re.match(pattern, query_lower, re.IGNORECASE):
+                logger.info(f"[CLASSIFIER] Intent: greeting")
+                return {
+                    "intent": "greeting",
+                    "is_factual_financial": False,
+                    "requires_verified_source": False,
+                    "confidence": 1.0,
+                    "keywords_found": []
+                }
+        
+        # STEP 2: Check for financial keywords
         keywords_found = []
         for keyword in QueryClassifier.FINANCIAL_KEYWORDS:
             if keyword in query_lower:
@@ -64,8 +95,25 @@ class QueryClassifier:
                 has_numeric = True
                 break
         
-        # Determine if factual financial query
+        # STEP 3: Determine intent
         is_factual_financial = len(keywords_found) > 0 or has_numeric
+        
+        # Check if it's general knowledge (not document-specific)
+        is_general_knowledge = False
+        if not is_factual_financial:
+            for indicator in QueryClassifier.GENERAL_KNOWLEDGE_INDICATORS:
+                if indicator in query_lower:
+                    is_general_knowledge = True
+                    break
+        
+        # Determine intent
+        if is_factual_financial:
+            intent = "financial_document_query"
+        elif is_general_knowledge:
+            intent = "general_knowledge"
+        else:
+            # Default to financial_document_query if unclear (safer to use RAG)
+            intent = "financial_document_query"
         
         # Calculate confidence
         confidence = 0.0
@@ -75,15 +123,18 @@ class QueryClassifier:
             confidence = 0.7
         elif has_numeric:
             confidence = 0.5
+        elif is_general_knowledge:
+            confidence = 0.8
         
         requires_verified_source = is_factual_financial
         
-        logger.info(f"[CLASSIFIER] Query classified: factual_financial={is_factual_financial}, "
+        logger.info(f"[CLASSIFIER] Intent: {intent}, factual_financial={is_factual_financial}, "
                    f"requires_source={requires_verified_source}, confidence={confidence:.2f}")
         if keywords_found:
             logger.info(f"[CLASSIFIER] Keywords found: {keywords_found}")
         
         return {
+            "intent": intent,
             "is_factual_financial": is_factual_financial,
             "requires_verified_source": requires_verified_source,
             "confidence": confidence,

@@ -9,14 +9,31 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-# Only load .env in development (not in production)
-# In production (Azure App Service), all config comes from environment variables
-if os.getenv("AZURE_APP_SERVICE") is None and os.getenv("PYTHON_ENV") != "production":
+# Only load .env in local development (NOT in Docker or production)
+# In Docker/production, all config MUST come from environment variables
+# Docker users MUST use: docker run --env-file .env
+is_docker = os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER") == "true"
+is_production = os.getenv("AZURE_APP_SERVICE") is not None or os.getenv("PYTHON_ENV") == "production"
+
+if not is_docker and not is_production:
+    # Local development only - load .env file
     try:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
         pass  # dotenv not installed, use environment variables only
+elif is_docker:
+    # Docker environment - .env must be loaded via --env-file
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning("=" * 60)
+    logger.warning("DOCKER ENVIRONMENT DETECTED")
+    logger.warning("=" * 60)
+    logger.warning("Environment variables must be provided via:")
+    logger.warning("  docker run --env-file .env <image>")
+    logger.warning("  OR")
+    logger.warning("  docker run -e VAR1=value1 -e VAR2=value2 <image>")
+    logger.warning("=" * 60)
 
 
 @dataclass(frozen=True)
@@ -103,27 +120,65 @@ def load_config() -> AppConfig:
     )
 
 
+def _mask_secret(value: str, show_chars: int = 4) -> str:
+    """Mask secret values for logging (show first N chars + ...)."""
+    if not value or len(value) <= show_chars:
+        return "***"
+    return value[:show_chars] + "..." + ("*" * min(8, len(value) - show_chars - 3))
+
+
+def _log_env_var_status(var_name: str, is_set: bool, masked_value: str = None) -> None:
+    """Log environment variable detection status."""
+    import logging
+    logger = logging.getLogger(__name__)
+    status = "✓ SET" if is_set else "✗ MISSING"
+    value_info = f" (value: {masked_value})" if masked_value else ""
+    logger.info(f"  {status}: {var_name}{value_info}")
+
+
 def validate_config(config: AppConfig) -> None:
-    """Validates configuration and prints status."""
-    print("=" * 60)
-    print("CONFIGURATION LOADED")
-    print("=" * 60)
+    """Validates configuration and prints status with masked secrets."""
+    import logging
+    logger = logging.getLogger(__name__)
     
-    # Azure OpenAI
-    print(f"Azure OpenAI Endpoint: {config.azure_openai.endpoint[:50]}...")
-    print(f"Azure OpenAI Chat Deployment: {config.azure_openai.chat_deployment}")
-    print(f"Azure OpenAI Embeddings Deployment: {config.azure_openai.embeddings_deployment}")
+    logger.info("=" * 60)
+    logger.info("CONFIGURATION VALIDATION")
+    logger.info("=" * 60)
+    
+    # Log Azure OpenAI environment variables (masked)
+    logger.info("Azure OpenAI Configuration:")
+    _log_env_var_status("AZURE_OPENAI_API_KEY", bool(os.getenv("AZURE_OPENAI_API_KEY")), 
+                       _mask_secret(os.getenv("AZURE_OPENAI_API_KEY", "")))
+    _log_env_var_status("AZURE_OPENAI_ENDPOINT", bool(os.getenv("AZURE_OPENAI_ENDPOINT")),
+                       os.getenv("AZURE_OPENAI_ENDPOINT", "not set")[:50] + "..." if os.getenv("AZURE_OPENAI_ENDPOINT") else None)
+    _log_env_var_status("AZURE_OPENAI_API_VERSION", bool(os.getenv("AZURE_OPENAI_API_VERSION")),
+                       os.getenv("AZURE_OPENAI_API_VERSION", "not set"))
+    _log_env_var_status("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", bool(os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")),
+                       os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME", "not set"))
+    _log_env_var_status("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME", bool(os.getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME")),
+                       os.getenv("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME", "not set"))
+    
+    logger.info("")
+    logger.info("Loaded Configuration:")
+    logger.info(f"  Endpoint: {config.azure_openai.endpoint[:50]}...")
+    logger.info(f"  Chat Deployment: {config.azure_openai.chat_deployment}")
+    logger.info(f"  Embeddings Deployment: {config.azure_openai.embeddings_deployment}")
+    logger.info(f"  API Version: {config.azure_openai.api_version}")
     
     # Azure Blob
-    print(f"Azure Blob Container: {config.azure_blob.container_name}")
+    logger.info("")
+    logger.info("Azure Blob Storage:")
+    logger.info(f"  Container: {config.azure_blob.container_name}")
     
     # Chroma Cloud
-    print(f"Chroma Cloud Host: {config.chroma_cloud.host}")
-    print(f"Chroma Cloud Tenant: {config.chroma_cloud.tenant}")
-    print(f"Chroma Cloud Database: {config.chroma_cloud.database}")
-    print(f"Chroma Cloud Collection: {config.chroma_cloud.collection_name}")
+    logger.info("")
+    logger.info("Chroma Cloud:")
+    logger.info(f"  Host: {config.chroma_cloud.host}")
+    logger.info(f"  Tenant: {config.chroma_cloud.tenant}")
+    logger.info(f"  Database: {config.chroma_cloud.database}")
+    logger.info(f"  Collection: {config.chroma_cloud.collection_name}")
     
-    print("=" * 60)
+    logger.info("=" * 60)
 
 
 # Singleton config instance
