@@ -77,6 +77,15 @@ class CompanyValidator:
             "wipro": "Wipro Limited",
             "hcl technologies": "HCL Technologies Limited",
             "hcl": "HCL Technologies Limited",
+            "icici bank": "ICICI Bank Limited",
+            "icici": "ICICI Bank Limited",
+            "icici bank limited": "ICICI Bank Limited",
+            "hdfc bank": "HDFC Bank Limited",
+            "hdfc": "HDFC Bank Limited",
+            "axis bank": "Axis Bank Limited",
+            "axis": "Axis Bank Limited",
+            "sbi": "State Bank of India",
+            "state bank of india": "State Bank of India",
         }
         
         # Check for full company names first (longest match wins)
@@ -88,15 +97,33 @@ class CompanyValidator:
         # Common company name patterns (fallback)
         company_patterns = [
             r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:Limited|Ltd|Inc|Corporation|Corp|LLC)\b',
-            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Financial|Services|Technologies|Tech)\s+(?:Software|Limited|Ltd)?)\b',
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Financial|Services|Technologies|Tech|Bank)\s+(?:Software|Limited|Ltd)?)\b',
+            # Bank-specific patterns (handle "ICICI Bank", "HDFC Bank", etc.)
+            r'\b([A-Z]+(?:\s+[A-Z]+)*)\s+Bank\b',
+            r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+Bank\b',
         ]
         
         for pattern in company_patterns:
             match = re.search(pattern, query, re.IGNORECASE)
             if match:
                 extracted = match.group(1).strip()
-                logger.info(f"[VALIDATOR] Extracted company from pattern: '{extracted}'")
-                return extracted
+                # Check if it's a known bank and normalize
+                extracted_lower = extracted.lower()
+                if "icici" in extracted_lower:
+                    logger.info(f"[VALIDATOR] Extracted company from pattern: 'ICICI Bank Limited' (matched '{extracted}')")
+                    return "ICICI Bank Limited"
+                elif "hdfc" in extracted_lower:
+                    logger.info(f"[VALIDATOR] Extracted company from pattern: 'HDFC Bank Limited' (matched '{extracted}')")
+                    return "HDFC Bank Limited"
+                elif "axis" in extracted_lower:
+                    logger.info(f"[VALIDATOR] Extracted company from pattern: 'Axis Bank Limited' (matched '{extracted}')")
+                    return "Axis Bank Limited"
+                elif "sbi" in extracted_lower or "state bank" in extracted_lower:
+                    logger.info(f"[VALIDATOR] Extracted company from pattern: 'State Bank of India' (matched '{extracted}')")
+                    return "State Bank of India"
+                else:
+                    logger.info(f"[VALIDATOR] Extracted company from pattern: '{extracted}'")
+                    return extracted
         
         logger.warning(f"[VALIDATOR] Could not extract company name from query: {query}")
         return None

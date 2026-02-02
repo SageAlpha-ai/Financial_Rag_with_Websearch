@@ -712,13 +712,68 @@ Answer:"""
             
             logger.info(f"[CLASSIFIER] Query requires verified source: {requires_verified_source}")
             
-            # STEP 1: ALWAYS perform RAG retrieval first (NO EXCEPTIONS)
-            logger.info("[RETRIEVER] Starting RAG retrieval...")
-            documents, metadatas = self._retrieve_documents_hybrid(question)
+            # STEP 0.5: COMPANY-SPECIFIC ROUTING POLICY
+            # Check if query is about OFSS (the only company with verified RAG documents)
+            query_company = CompanyValidator._extract_company_from_query(question)
+            is_ofss_query = False
+            
+            if query_company:
+                # Check if the company is Oracle Financial Services Software Ltd (OFSS)
+                ofss_variants = [
+                    "Oracle Financial Services Software Ltd",
+                    "Oracle Financial Services Software",
+                    "Oracle Financial Services",
+                    "Oracle Financial",
+                    "OFSS"
+                ]
+                query_company_normalized = query_company.lower().strip()
+                is_ofss_query = any(
+                    variant.lower().strip() in query_company_normalized or 
+                    query_company_normalized in variant.lower().strip()
+                    for variant in ofss_variants
+                )
+                
+                logger.info("=" * 60)
+                logger.info("[ROUTER] COMPANY-SPECIFIC ROUTING DECISION")
+                logger.info("=" * 60)
+                logger.info(f"Query company: {query_company}")
+                logger.info(f"Is OFSS query: {is_ofss_query}")
+                
+                if is_ofss_query:
+                    logger.info("[ROUTER] ✓ OFSS query detected → Using RAG pipeline with strict evidence gate")
+                else:
+                    logger.info(f"[ROUTER] ⚠ Non-OFSS company ({query_company}) → Skipping RAG, using LLM with disclaimer")
+                    logger.info("[ROUTER] RAG knowledge base only contains verified OFSS documents")
+                logger.info("=" * 60)
+            
+            # STEP 1: CONDITIONAL RAG RETRIEVAL
+            # CRITICAL RULE: Only perform RAG retrieval for OFSS queries
+            # If company is not detected OR is non-OFSS → Skip RAG entirely
+            documents = []
+            metadatas = []
+            
+            if is_ofss_query:
+                logger.info("[RETRIEVER] Starting RAG retrieval for OFSS query...")
+                documents, metadatas = self._retrieve_documents_hybrid(question)
+            else:
+                if query_company:
+                    logger.info(f"[ROUTER] Skipping RAG retrieval for non-OFSS company: {query_company}")
+                    logger.info("[ROUTER] Will use LLM-only answer with appropriate disclaimer")
+                    logger.info("[ROUTER] RAG knowledge base only contains verified OFSS documents")
+                else:
+                    # CRITICAL: No company detected → Use LLM only (never use RAG)
+                    logger.warning("=" * 60)
+                    logger.warning("[ROUTER] COMPANY NOT DETECTED → LLM-ONLY MODE")
+                    logger.warning("=" * 60)
+                    logger.warning("Company name could not be extracted from query")
+                    logger.warning("RAG is ONLY allowed for verified OFSS queries")
+                    logger.warning("Skipping RAG retrieval to prevent cross-company contamination")
+                    logger.warning("Using LLM-only answer with disclaimer")
+                    logger.warning("=" * 60)
             
             # STEP 1.5: Validate company match to prevent cross-company contamination
             # Only validate if we have documents AND the query mentions a specific company
-            query_company = CompanyValidator._extract_company_from_query(question)
+            # For OFSS queries, ensure we only use OFSS documents
             if documents and metadatas and query_company:
                 logger.info(f"[VALIDATOR] Validating company name match (query company: '{query_company}')...")
                 original_count = len(documents)
@@ -792,60 +847,71 @@ Answer:"""
                     }
             
             # STEP 2: Decide if web search should be triggered
+            # Only trigger web search for OFSS queries (or queries without company specified)
             web_documents = []
-            should_search, search_reason = should_trigger_web_search(
-                question,
-                documents,
-                metadatas,
-                similarity_scores
-            )
             
-            if should_search:
-                logger.info(f"[WEB_SEARCH] Triggering web search: {search_reason}")
-                web_documents = self._retrieve_web_evidence(question)
+            if is_ofss_query or not query_company:
+                # For OFSS queries or general queries, consider web search
+                should_search, search_reason = should_trigger_web_search(
+                    question,
+                    documents,
+                    metadatas,
+                    similarity_scores
+                )
+                
+                if should_search:
+                    logger.info(f"[WEB_SEARCH] Triggering web search: {search_reason}")
+                    web_documents = self._retrieve_web_evidence(question)
+                else:
+                    logger.info(f"[WEB_SEARCH] Skipping web search: {search_reason}")
             else:
-                logger.info(f"[WEB_SEARCH] Skipping web search: {search_reason}")
+                # For non-OFSS companies, skip web search (will use LLM-only)
+                logger.info(f"[WEB_SEARCH] Skipping web search for non-OFSS company: {query_company}")
             
-            # STEP 3: Evidence Gate - CRITICAL: Block LLM-only answers for factual financial queries
-            if not documents and not web_documents:
-                # No documents retrieved
-                logger.warning("[ROUTER] No documents retrieved")
-                logger.warning("[ROUTER] This may indicate:")
-                logger.warning("[ROUTER] 1. ChromaDB collection is empty or not properly indexed")
-                logger.warning("[ROUTER] 2. Query embeddings don't match stored embeddings")
-                logger.warning("[ROUTER] 3. Company validator rejected all documents")
+            # STEP 3: COMPANY-SPECIFIC EVIDENCE GATE
+            # Apply strict evidence gate ONLY for OFSS queries
+            # For non-OFSS companies or undetected companies, allow LLM answers with disclaimer
+            
+            # CRITICAL: If no company detected, skip RAG entirely and use LLM-only
+            if not query_company:
+                logger.info("=" * 60)
+                logger.info("[RESPONSE TYPE] LLM-ONLY (Company Not Detected)")
+                logger.info("=" * 60)
+                logger.info("Company name could not be extracted from query")
+                logger.info("RAG is ONLY allowed for verified OFSS queries")
+                logger.info("Using LLM to answer based on publicly available information")
+                logger.info("=" * 60)
                 
-                # ABSOLUTE RULE: If query requires verified source, BLOCK LLM answer
-                if requires_verified_source:
-                    logger.error("[EVIDENCE_GATE] BLOCKED: Factual financial query without verified sources")
-                    logger.error("[EVIDENCE_GATE] LLM is NOT allowed to answer factual financial questions without sources")
-                    
-                    return {
-                        "answer": "The requested information could not be verified from official sources.",
-                        "answer_type": "sagealpha_ai_search",  # Use search type, not LLM
-                        "sources": []  # Empty sources indicate no verified data
-                    }
+                # Use LLM with disclaimer prompt
+                llm_prompt_with_disclaimer = f"""You are a financial assistant.
+
+Answer the user's question using general public financial knowledge.
+
+IMPORTANT CONSTRAINTS:
+- If exact audited figures are uncertain, say so clearly
+- Do not claim access to internal or proprietary documents
+- Provide approximate or reported values when exact figures are unavailable
+- Be transparent about data sources
+
+Question: {question}
+
+Always include this disclaimer at the end:
+"This answer is based on publicly available information and may not be officially verified. For verified financial data, please refer to the company's official investor relations website or annual reports."
+
+Answer:"""
                 
-                # Only allow LLM for non-factual queries (conceptual, general knowledge)
-                logger.warning("=" * 60)
-                logger.warning("[RESPONSE TYPE] LLM FALLBACK (No RAG documents available)")
-                logger.warning("=" * 60)
-                logger.warning("No documents retrieved from ChromaDB. Using LLM-only answer.")
-                logger.warning("To enable RAG answers, run: python ingest.py --fresh")
-                logger.warning("=" * 60)
-                answer = self.llm_only_chain.invoke({"question": question})
-                logger.info("[LLM] Answer generated from general knowledge")
+                answer = self.llm_only_chain.invoke({"question": llm_prompt_with_disclaimer})
+                logger.info("[LLM] Answer generated with disclaimer (company not detected)")
                 
-                # For non-factual queries, use sagealpha_rag (not LLM)
                 answer_type = "sagealpha_rag"
-                logger.info(f"[RESPONSE] answer_type={answer_type} (LLM fallback, no sources)")
-                logger.info("[RESPONSE] Returning LLM-only answer to user")
+                logger.info(f"[RESPONSE] answer_type={answer_type} (LLM-only, company not detected)")
                 
-                # For LLM answers, create a source indicating it's from general knowledge
+                # Create source indicating it's from general knowledge
                 llm_sources = [{
-                    "title": "General Knowledge Base",
+                    "title": "Public Financial Information",
                     "publisher": "SageAlpha AI",
-                    "note": "Answer generated from general knowledge. For verified financial data, please ensure relevant documents are indexed in the knowledge base."
+                    "url": None,
+                    "note": "Answer generated from publicly available information. For verified financial data, please refer to the company's official investor relations website or annual reports."
                 }]
                 
                 return {
@@ -853,6 +919,100 @@ Answer:"""
                     "answer_type": answer_type,
                     "sources": llm_sources
                 }
+            
+            if not documents and not web_documents:
+                # No documents retrieved
+                logger.warning("[ROUTER] No documents retrieved")
+                
+                if is_ofss_query:
+                    # OFSS query but no documents - apply strict evidence gate
+                    logger.warning("[ROUTER] This may indicate:")
+                    logger.warning("[ROUTER] 1. ChromaDB collection is empty or not properly indexed")
+                    logger.warning("[ROUTER] 2. Query embeddings don't match stored embeddings")
+                    logger.warning("[ROUTER] 3. Company validator rejected all documents")
+                    
+                    # ABSOLUTE RULE: For OFSS queries, BLOCK LLM answer if no verified sources
+                    if requires_verified_source:
+                        logger.error("[EVIDENCE_GATE] BLOCKED: OFSS factual financial query without verified sources")
+                        logger.error("[EVIDENCE_GATE] LLM is NOT allowed to answer OFSS factual questions without sources")
+                        
+                        return {
+                            "answer": "The requested information could not be verified from official sources.",
+                            "answer_type": "sagealpha_ai_search",
+                            "sources": []
+                        }
+                    
+                    # Non-factual OFSS query - allow LLM fallback
+                    logger.warning("=" * 60)
+                    logger.warning("[RESPONSE TYPE] LLM FALLBACK (No RAG documents for OFSS)")
+                    logger.warning("=" * 60)
+                    logger.warning("No documents retrieved from ChromaDB. Using LLM-only answer.")
+                    logger.warning("To enable RAG answers, run: python ingest.py --fresh")
+                    logger.warning("=" * 60)
+                    answer = self.llm_only_chain.invoke({"question": question})
+                    logger.info("[LLM] Answer generated from general knowledge")
+                    
+                    answer_type = "sagealpha_rag"
+                    logger.info(f"[RESPONSE] answer_type={answer_type} (LLM fallback, no sources)")
+                    
+                    llm_sources = [{
+                        "title": "General Knowledge Base",
+                        "publisher": "SageAlpha AI",
+                        "note": "Answer generated from general knowledge. For verified financial data, please ensure relevant documents are indexed in the knowledge base."
+                    }]
+                    
+                    return {
+                        "answer": answer,
+                        "answer_type": answer_type,
+                        "sources": llm_sources
+                    }
+                else:
+                    # Non-OFSS company - allow LLM answer with disclaimer
+                    logger.info("=" * 60)
+                    logger.info("[RESPONSE TYPE] LLM-ONLY (Non-OFSS Company)")
+                    logger.info("=" * 60)
+                    logger.info(f"Query is about {query_company} (not OFSS)")
+                    logger.info("RAG knowledge base only contains verified OFSS documents")
+                    logger.info("Using LLM to answer based on publicly available information")
+                    logger.info("=" * 60)
+                    
+                    # Use LLM with disclaimer prompt
+                    llm_prompt_with_disclaimer = f"""You are a financial assistant.
+
+Answer the user's question about {query_company} using general public financial knowledge.
+
+IMPORTANT CONSTRAINTS:
+- If exact audited figures are uncertain, say so clearly
+- Do not claim access to internal or proprietary documents
+- Provide approximate or reported values when exact figures are unavailable
+- Be transparent about data sources
+
+Question: {question}
+
+Always include this disclaimer at the end:
+"This answer is based on publicly available information and may not be officially verified. For verified financial data, please refer to the company's official investor relations website or annual reports."
+
+Answer:"""
+                    
+                    answer = self.llm_only_chain.invoke({"question": llm_prompt_with_disclaimer})
+                    logger.info("[LLM] Answer generated with disclaimer for non-OFSS company")
+                    
+                    answer_type = "sagealpha_rag"
+                    logger.info(f"[RESPONSE] answer_type={answer_type} (LLM-only, non-OFSS company)")
+                    
+                    # Create source indicating it's from general knowledge
+                    llm_sources = [{
+                        "title": "Public Financial Information",
+                        "publisher": "SageAlpha AI",
+                        "url": None,
+                        "note": f"Answer generated from publicly available information about {query_company}. For verified financial data, please refer to the company's official investor relations website or annual reports."
+                    }]
+                    
+                    return {
+                        "answer": answer,
+                        "answer_type": answer_type,
+                        "sources": llm_sources
+                    }
             
             # STEP 4: Validate answerability (if we have RAG docs)
             is_answerable = True
