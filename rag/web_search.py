@@ -3,6 +3,9 @@ Web Search Module using SerpApi
 
 Searches for company investor relations pages and official documents.
 Follows strict validation rules to ensure only official sources are used.
+
+Source‑priority configuration (PRIORITY_WEB_DOMAINS, ALLOWED_FALLBACK_DOMAINS,
+BLOCKED_DOMAINS) is defined centrally in config/settings.py.
 """
 
 import logging
@@ -14,7 +17,53 @@ from urllib.parse import urlparse, urljoin
 import requests
 from serpapi import GoogleSearch
 
+from config import PRIORITY_WEB_DOMAINS, ALLOWED_FALLBACK_DOMAINS, BLOCKED_DOMAINS
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Domain helper utilities (module‑level, stateless)
+# ---------------------------------------------------------------------------
+
+def _extract_domain(url: str) -> str:
+    """Return the lowercase netloc (domain) of *url*."""
+    return urlparse(url).netloc.lower()
+
+
+def _matches_domain_list(domain: str, domain_list: List[str]) -> bool:
+    """
+    Return True if *domain* matches any entry in *domain_list*.
+
+    An entry is matched when:
+      • the domain equals the entry, OR
+      • the domain ends with "." + entry  (sub‑domain match), OR
+      • the entry starts with "." and the domain ends with that suffix.
+    """
+    for entry in domain_list:
+        if entry.startswith("."):
+            # Suffix match (e.g. ".gov.in")
+            if domain.endswith(entry) or domain.endswith(entry.lstrip(".")):
+                return True
+        else:
+            if domain == entry or domain.endswith("." + entry):
+                return True
+    return False
+
+
+def _is_blocked(domain: str) -> bool:
+    """Return True if *domain* belongs to a blocked source."""
+    return _matches_domain_list(domain, BLOCKED_DOMAINS)
+
+
+def _is_priority_domain(domain: str) -> bool:
+    """Return True if *domain* belongs to a priority source."""
+    return _matches_domain_list(domain, PRIORITY_WEB_DOMAINS)
+
+
+def _is_fallback_domain(domain: str) -> bool:
+    """Return True if *domain* matches an allowed fallback suffix."""
+    return _matches_domain_list(domain, ALLOWED_FALLBACK_DOMAINS)
 
 
 class WebSearchEngine:
@@ -42,7 +91,113 @@ class WebSearchEngine:
         else:
             self.enabled = True
             logger.info("Web search engine initialized with SerpApi")
-    
+
+    # ------------------------------------------------------------------
+    # Phased search & result filtering
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_site_restriction(domains: List[str]) -> str:
+        """Build a Google ``site:`` restriction string for *domains*.
+
+        Entries that start with ``"."`` (suffix matches such as ``".gov.in"``)
+        have the leading dot stripped so the ``site:`` operator covers all
+        sub‑domains (e.g. ``site:gov.in``).
+        """
+        parts = []
+        for d in domains:
+            clean = d.lstrip(".")
+            parts.append(f"site:{clean}")
+        return " OR ".join(parts)
+
+    def _execute_serpapi_query(self, query: str, num: int = 10) -> List[Dict]:
+        """Execute a single SerpApi Google query and return organic results."""
+        params = {
+            "q": query,
+            "api_key": self.api_key,
+            "engine": "google",
+            "num": num,
+        }
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        return results.get("organic_results", [])
+
+    def _filter_results(self, results: List[Dict], *, phase: str = "") -> List[Dict]:
+        """Filter *results* through blocked / priority / fallback domain rules.
+
+        Returns only results whose domains are:
+          1. NOT in BLOCKED_DOMAINS, **and**
+          2. in PRIORITY_WEB_DOMAINS or matching ALLOWED_FALLBACK_DOMAINS.
+        """
+        filtered: List[Dict] = []
+        for result in results:
+            link = result.get("link", "")
+            domain = _extract_domain(link)
+
+            if _is_blocked(domain):
+                logger.debug(
+                    "[WEB_SEARCH][%s] Rejected blocked domain: %s (%s)",
+                    phase, domain, link,
+                )
+                continue
+
+            if not (_is_priority_domain(domain) or _is_fallback_domain(domain)):
+                logger.debug(
+                    "[WEB_SEARCH][%s] Rejected non‑priority/non‑fallback domain: %s (%s)",
+                    phase, domain, link,
+                )
+                continue
+
+            filtered.append(result)
+        return filtered
+
+    def _phased_search(self, base_query: str, num: int = 10) -> List[Dict]:
+        """Execute a two‑phase search respecting source‑priority config.
+
+        Phase 1 – search restricted to PRIORITY_WEB_DOMAINS.
+        Phase 2 – (only when Phase 1 yields 0 results) search restricted to
+                  ALLOWED_FALLBACK_DOMAINS.
+
+        All results are additionally filtered through ``_filter_results``.
+        """
+        # --- Phase 1: priority domains ---
+        site_clause = self._build_site_restriction(PRIORITY_WEB_DOMAINS)
+        phase1_query = f"{base_query} ({site_clause})"
+        raw_results = self._execute_serpapi_query(phase1_query, num=num)
+        filtered = self._filter_results(raw_results, phase="Phase1")
+
+        if filtered:
+            logger.info(
+                "[WEB_SEARCH] Phase 1 returned %d result(s) from priority domains.",
+                len(filtered),
+            )
+            return filtered
+
+        # --- Phase 2: fallback domains ---
+        logger.debug(
+            "[WEB_SEARCH] Phase 1 returned 0 results. Falling back to Phase 2 "
+            "(ALLOWED_FALLBACK_DOMAINS: %s).",
+            ALLOWED_FALLBACK_DOMAINS,
+        )
+        site_clause = self._build_site_restriction(ALLOWED_FALLBACK_DOMAINS)
+        phase2_query = f"{base_query} ({site_clause})"
+        raw_results = self._execute_serpapi_query(phase2_query, num=num)
+        filtered = self._filter_results(raw_results, phase="Phase2")
+
+        if filtered:
+            logger.info(
+                "[WEB_SEARCH] Phase 2 returned %d result(s) from fallback domains.",
+                len(filtered),
+            )
+            return filtered
+
+        logger.info("[WEB_SEARCH] Both phases returned 0 results.")
+        return []
+
+    # ------------------------------------------------------------------
+    # Public search methods
+    # ------------------------------------------------------------------
+
     def search_company_investor_relations(
         self, 
         company_name: str
@@ -72,21 +227,21 @@ class WebSearchEngine:
         try:
             logger.info(f"[WEB_SEARCH] Searching for investor relations: {company_name}")
             
-            # Search query: company name + "investor relations"
-            search_query = f'"{company_name}" investor relations official website'
-            
-            params = {
-                "q": search_query,
-                "api_key": self.api_key,
-                "engine": "google",
-                "num": 10
-            }
-            
-            search = GoogleSearch(params)
-            results = search.get_dict()
-            
-            organic_results = results.get("organic_results", [])
-            logger.info(f"[WEB_SEARCH] Found {len(organic_results)} search results")
+            # Base query (without site restriction – phased search adds it)
+            base_query = f'"{company_name}" investor relations official website'
+
+            organic_results = self._phased_search(base_query, num=10)
+            logger.info(f"[WEB_SEARCH] Filtered to {len(organic_results)} result(s)")
+
+            if not organic_results:
+                logger.warning(f"[WEB_SEARCH] No results after phased search for {company_name}")
+                return {
+                    "official_domain": None,
+                    "investor_url": None,
+                    "search_results": [],
+                    "success": False,
+                    "error": "No results from priority or fallback domains"
+                }
             
             # Find official domain
             official_domain = self._identify_official_domain(company_name, organic_results)
@@ -269,6 +424,9 @@ class WebSearchEngine:
         """
         Search for specific financial documents.
         
+        Uses the two‑phase search (priority → fallback domains) and applies
+        domain filtering from the centralised config.
+        
         Args:
             company_name: Company name
             document_type: Type of document (annual report, 10-k, earnings, etc.)
@@ -284,40 +442,43 @@ class WebSearchEngine:
             query_parts = [f'"{company_name}"', document_type]
             if year:
                 query_parts.append(year)
-            query_parts.append("site:investor OR site:ir OR filetype:pdf")
-            
-            search_query = " ".join(query_parts)
-            
-            params = {
-                "q": search_query,
-                "api_key": self.api_key,
-                "engine": "google",
-                "num": 10,
-                "fileType": "pdf"
-            }
-            
-            search = GoogleSearch(params)
-            results = search.get_dict()
-            
-            organic_results = results.get("organic_results", [])
-            
-            # Filter to only official domains
-            filtered_results = []
+            query_parts.append("filetype:pdf")
+
+            base_query = " ".join(query_parts)
+
+            # Phased search already restricts to priority / fallback domains
+            organic_results = self._phased_search(base_query, num=10)
+
+            # Additional PDF‑specific filtering
+            filtered_results: List[Dict] = []
             for result in organic_results:
                 link = result.get("link", "")
-                parsed = urlparse(link)
-                domain = parsed.netloc.lower()
-                
-                # Only accept PDFs from official-looking domains
-                if link.endswith(".pdf") and not any(reject in domain for reject in [
-                    "wikipedia", "blog", "news", "medium"
-                ]):
+                domain = _extract_domain(link)
+
+                # Blocked‑domain check (belt‑and‑suspenders – _phased_search
+                # already filters, but guard against future refactors)
+                if _is_blocked(domain):
+                    logger.debug(
+                        "[WEB_SEARCH][docs] Rejected blocked domain: %s (%s)",
+                        domain, link,
+                    )
+                    continue
+
+                # Only accept PDFs from priority or fallback domains
+                if link.lower().endswith(".pdf") and (
+                    _is_priority_domain(domain) or _is_fallback_domain(domain)
+                ):
                     filtered_results.append({
                         "title": result.get("title", ""),
                         "link": link,
                         "snippet": result.get("snippet", ""),
-                        "type": document_type
+                        "type": document_type,
                     })
+                else:
+                    logger.debug(
+                        "[WEB_SEARCH][docs] Skipped non‑PDF or non‑allowed domain: %s (%s)",
+                        domain, link,
+                    )
             
             logger.info(f"[WEB_SEARCH] Found {len(filtered_results)} financial documents")
             return filtered_results

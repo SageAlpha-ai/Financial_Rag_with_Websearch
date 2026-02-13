@@ -12,13 +12,14 @@ import logging
 import json
 from typing import Dict, Any, List, Optional
 
-from langchain_openai import AzureChatOpenAI
+from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from config.settings import get_config
 from vectorstore.chroma_client import get_collection
 from rag.source_formatter import SourceFormatter
+from rag.metrics import MetricsRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +94,7 @@ class ReportGenerator:
         # Azure OpenAI LLM (for report generation)
         self.llm = AzureChatOpenAI(
             azure_endpoint=config.azure_openai.endpoint,
-            azure_deployment=config.azure_openai.chat_deployment,
+            azure_deployment=config.azure_openai.large_chat_deployment,
             api_key=config.azure_openai.api_key,
             api_version=config.azure_openai.api_version,
             temperature=0.3,  # Slightly creative for narrative
@@ -102,16 +103,33 @@ class ReportGenerator:
         self.output_parser = StrOutputParser()
         self.collection = get_collection(create_if_missing=False)
         
+        # Embedding client — same deployment as ingestion and the orchestrator
+        # to ensure vector-space consistency.
+        embedding_kwargs = {
+            "azure_endpoint": config.azure_openai.endpoint,
+            "azure_deployment": config.azure_openai.embeddings_deployment,
+            "api_key": config.azure_openai.api_key,
+            "api_version": config.azure_openai.api_version,
+        }
+        if "text-embedding-ada-002" in config.azure_openai.embeddings_deployment.lower():
+            embedding_kwargs["model"] = "text-embedding-ada-002"
+        self.embeddings = AzureOpenAIEmbeddings(**embedding_kwargs)
+        
         # Setup report prompt
         self.report_template = """You are a Senior Equity Research Analyst.
 
-Using the factual context provided below, generate a professional investment research report.
+Using ONLY the factual context provided below, generate a professional investment research report.
 
-The report should be comprehensive, well-structured, and include:
+The report MUST be grounded entirely in the provided documents.
+Do NOT invent, estimate, or hallucinate any financial figures, metrics, or data points.
+If a standard report section (e.g. Financial Analysis, Valuation) cannot be supported
+by the provided context, omit that section or explicitly state that data is unavailable.
+
+Include only sections for which factual evidence exists:
 - Executive Summary
 - Company Overview
-- Financial Analysis
-- Investment Thesis
+- Financial Analysis (only if numeric data is present)
+- Investment Thesis (only if supported by evidence)
 - Risks and Considerations
 - Conclusion and Recommendation
 
@@ -121,7 +139,7 @@ FACTUAL CONTEXT:
 USER REQUEST:
 {query}
 
-Generate a detailed, professional research report. Write in a clear, analytical style suitable for institutional investors.
+Generate a detailed, professional research report using only the facts above. Write in a clear, analytical style suitable for institutional investors. If required financial data is not present in the context, state that the information is not available rather than estimating.
 
 Report:"""
         
@@ -130,7 +148,10 @@ Report:"""
     
     def _retrieve_facts(self, query: str, n_results: int = 10) -> tuple[List[str], List[Dict]]:
         """
-        Retrieve factual documents from Chroma.
+        Retrieve factual documents from Chroma using embedding-based search.
+
+        Uses the same Azure OpenAI embedding model as ingestion and the
+        orchestrator to ensure vector-space consistency.
         
         Args:
             query: User query
@@ -140,8 +161,9 @@ Report:"""
             (documents, metadatas)
         """
         try:
+            query_embedding = self.embeddings.embed_query(query)
             results = self.collection.query(
-                query_texts=[query],
+                query_embeddings=[query_embedding],
                 n_results=n_results,
                 include=["documents", "metadatas", "distances"]
             )
@@ -149,9 +171,13 @@ Report:"""
             documents = results.get("documents", [[]])[0] if results.get("documents") else []
             metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
             
+            logger.info(
+                "[REPORT] Embedding-based retrieval returned %d documents",
+                len(documents),
+            )
             return documents, metadatas
         except Exception as e:
-            logger.error(f"Document retrieval failed: {e}")
+            logger.error("[REPORT] Document retrieval failed: %s", e)
             return [], []
     
     def generate_report(self, query: str) -> Dict[str, Any]:
@@ -171,9 +197,36 @@ Report:"""
         try:
             # Phase 1: Retrieve facts
             documents, metadatas = self._retrieve_facts(query, n_results=10)
+
+            # ------------------------------------------------------------ #
+            # Evidence gate: report generation is higher-risk than Q&A.     #
+            # If no verified documents were retrieved, we MUST NOT invoke   #
+            # the LLM report chain — doing so would produce an entirely     #
+            # hallucinated financial report.                                 #
+            # ------------------------------------------------------------ #
+            if not documents:
+                logger.warning(
+                    "[REPORT] No verified documents retrieved — "
+                    "blocking report generation"
+                )
+                MetricsRecorder.record_insufficient_evidence(
+                    query, reason="no_documents_for_report",
+                )
+                return {
+                    "answer": (
+                        "Insufficient verified documents to generate a "
+                        "financial report. Please ensure relevant financial "
+                        "documents have been ingested, or try a more specific "
+                        "query."
+                    ),
+                    "answer_type": "sagealpha_rag",
+                    "sources": [],
+                    "format": "insufficient_evidence"
+                }
+
             fact_context = build_fact_context(documents, metadatas)
             
-            # Phase 2: Generate narrative report
+            # Phase 2: Generate narrative report (only with verified evidence)
             report_text = self.report_chain.invoke({
                 "query": query,
                 "context": fact_context

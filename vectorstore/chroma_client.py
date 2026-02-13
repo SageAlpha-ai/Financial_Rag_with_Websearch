@@ -9,7 +9,8 @@ STRICT RULES:
 - Local disk stores ZERO vectors
 """
 
-from typing import Optional
+import logging
+from typing import List, Optional
 import chromadb
 from chromadb import HttpClient
 from chromadb.config import Settings
@@ -162,22 +163,147 @@ def get_chroma_client() -> ClientAPI:
     return _client
 
 
+# ---------------------------------------------------------------------------
+# Multi-collection listing
+# ---------------------------------------------------------------------------
+
+_logger = logging.getLogger(__name__)
+
+# Collections that should be excluded from cross-collection search
+_SKIP_COLLECTIONS: set = {"chat_history"}
+
+
+def normalize_collection_name(name: str) -> str:
+    """Normalize collection name for deduplication and allowlist/denylist."""
+    return name.lower().replace("-", "").replace("_", "").strip()
+
+
+def list_all_collections(skip_internal: bool = True) -> List[Collection]:
+    """List all collections in the current Chroma database.
+
+    Used by the multi-collection retriever to search across every
+    company/dataset without relying on company-name-to-collection
+    resolution. When collection governance is enabled, normalizes names,
+    deduplicates by normalized name, and applies allowlist/denylist.
+
+    Args:
+        skip_internal: When ``True`` (default), excludes internal
+            collections such as ``chat_history``.
+
+    Returns:
+        A list of ``Collection`` objects, each ready to be queried.
+        Returns an empty list on failure (never raises).
+    """
+    try:
+        client = get_chroma_client()
+        raw_collections = client.list_collections()
+
+        # ChromaDB >= 0.5 returns Collection objects with .name
+        # Filter out internal collections
+        if skip_internal:
+            raw_collections = [
+                c for c in raw_collections
+                if getattr(c, "name", "") not in _SKIP_COLLECTIONS
+            ]
+
+        gov = get_config().collection_governance or {}
+        if not gov.get("enabled"):
+            _logger.info(
+                "[CHROMA] Listed %d searchable collections: %s",
+                len(raw_collections),
+                [getattr(c, "name", str(c)) for c in raw_collections],
+            )
+            return raw_collections
+
+        # Governance: pre-normalize allowlist/denylist once
+        governance_cfg = gov
+        raw_allowlist = governance_cfg.get("allowlist", [])
+        raw_denylist = governance_cfg.get("denylist", [])
+
+        normalized_allowlist = {
+            normalize_collection_name(name) for name in raw_allowlist
+        }
+        normalized_denylist = {
+            normalize_collection_name(name) for name in raw_denylist
+        }
+
+        normalize = governance_cfg.get("normalize", True)
+
+        # Deduplicate by normalized name (keep first occurrence), then apply allowlist/denylist
+        seen_norm: set = set()
+        deduped: List[Collection] = []
+        for c in raw_collections:
+            orig_name = getattr(c, "name", str(c))
+            norm_name = normalize_collection_name(orig_name) if normalize else orig_name
+            if norm_name in seen_norm:
+                continue
+            seen_norm.add(norm_name)
+            if norm_name in normalized_denylist:
+                continue
+            if normalized_allowlist and norm_name not in normalized_allowlist:
+                continue
+            deduped.append(c)
+
+        original_count = len(raw_collections)
+        final_count = len(deduped)
+        duplicates_removed = original_count - final_count
+        cleaned_collection_names = [getattr(c, "name", str(c)) for c in deduped]
+
+        _logger.info(
+            "collection_governance_applied",
+            extra={
+                "event_type": "collection_governance",
+                "original_count": original_count,
+                "final_count": final_count,
+                "duplicates_removed": duplicates_removed,
+                "collections": cleaned_collection_names,
+            },
+        )
+        return deduped
+    except Exception as e:
+        _logger.error("[CHROMA] Failed to list collections: %s", e)
+        return []
+
+
+from rag.company_normalizer import normalize_company_name
+
+def get_company_collection(company_name: str) -> Collection:
+    """
+    Gets or creates a collection for a specific company.
+    
+    Args:
+        company_name: Raw company name from query or planner.
+        
+    Returns:
+        Chroma Collection object (normalized name)
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    normalized_name = normalize_company_name(company_name)
+    client = get_chroma_client()
+    
+    logger.info(f"[CHROMA] Dataset: {get_config().chroma_cloud.database}")
+    logger.info(f"[CHROMA] Resolved Collection: {normalized_name}")
+    
+    collection = client.get_or_create_collection(
+        name=normalized_name,
+        metadata={"hnsw:space": "cosine"}
+    )
+    
+    doc_count = collection.count()
+    logger.info(f"[CHROMA] Collection '{normalized_name}' has {doc_count} documents")
+    
+    return collection
+
+
 def get_collection(
     name: Optional[str] = None,
     create_if_missing: bool = True
 ) -> Collection:
     """
-    Gets or creates the main documents collection.
-    
-    Args:
-        name: Collection name (defaults to config value)
-        create_if_missing: Whether to create if doesn't exist
-    
-    Returns:
-        Chroma Collection object
-    
-    Raises:
-        ValueError: If collection doesn't exist and create_if_missing is False
+    DEPRECATED: Use get_company_collection for per-company isolation.
+    Gets or creates a generic collection.
     """
     import os
     import logging
@@ -189,22 +315,14 @@ def get_collection(
     collection_name = name or config.collection_name
     
     # Check if auto-creation is enabled via environment variable
-    # Default: auto-create in development, strict in production
     auto_create_env = os.getenv("CHROMA_AUTO_CREATE_COLLECTION", "").lower()
-    is_production = os.getenv("PYTHON_ENV") == "production" or os.getenv("AZURE_APP_SERVICE")
     
     if auto_create_env == "true":
         create_if_missing = True
     elif auto_create_env == "false":
         create_if_missing = False
-    elif not auto_create_env and not is_production:
-        # Development mode: auto-create by default
-        create_if_missing = True
-        logger.info("[CHROMA] Development mode: auto-creating collections if missing")
-    # If not set and production, use the parameter value (strict mode)
     
-    logger.info(f"[CHROMA] Getting collection: {collection_name}")
-    logger.info(f"[CHROMA] create_if_missing: {create_if_missing}")
+    logger.info(f"[CHROMA] Getting collection: {collection_name} (Dataset: {config.database})")
     
     try:
         if create_if_missing:
@@ -212,42 +330,16 @@ def get_collection(
                 name=collection_name,
                 metadata={"hnsw:space": "cosine"}
             )
-            logger.info(f"[CHROMA] Collection '{collection_name}' ready (created or existing)")
         else:
-            # Try to get existing collection
-            try:
-                collection = client.get_collection(name=collection_name)
-                logger.info(f"[CHROMA] Collection '{collection_name}' found")
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "not found" in error_msg or "does not exist" in error_msg:
-                    logger.error(f"[CHROMA] Collection '{collection_name}' does not exist")
-                    logger.error(f"[CHROMA] To auto-create collections, set CHROMA_AUTO_CREATE_COLLECTION=true")
-                    logger.error(f"[CHROMA] Or run ingestion: python ingest.py --fresh")
-                    raise ValueError(
-                        f"Chroma collection '{collection_name}' does not exist. "
-                        f"Please either:\n"
-                        f"  1. Set CHROMA_AUTO_CREATE_COLLECTION=true to auto-create empty collections, or\n"
-                        f"  2. Run ingestion to populate the collection: python ingest.py --fresh"
-                    ) from e
-                else:
-                    # Re-raise other errors
-                    raise
+            collection = client.get_collection(name=collection_name)
         
         doc_count = collection.count()
-        logger.info(f"[CHROMA] Collection '{collection_name}' has {doc_count} documents")
-        print(f"Collection: {collection_name} ({doc_count} documents)")
-        
+        logger.info(f"[CHROMA] Collection '{collection_name}' ready with {doc_count} documents")
         return collection
         
-    except ValueError:
-        # Re-raise ValueError (our custom errors)
-        raise
     except Exception as e:
-        logger.error(f"[CHROMA] Failed to get collection '{collection_name}': {e}", exc_info=True)
-        raise ValueError(
-            f"Failed to access Chroma collection '{collection_name}': {str(e)}"
-        ) from e
+        logger.error(f"[CHROMA] Failed to get collection '{collection_name}': {e}")
+        raise ValueError(f"Failed to access Chroma collection '{collection_name}': {str(e)}") from e
 
 
 def get_chat_history_collection() -> Collection:
@@ -275,3 +367,30 @@ def delete_collection(name: str) -> None:
         print(f"Deleted collection: {name}")
     except Exception as e:
         print(f"Collection {name} not found or could not be deleted: {e}")
+
+def verify_and_recreate_collection(name: str) -> Collection:
+    """
+    Performs a health check on the collection. 
+    If it's corrupted or unreachable in a way that suggests a logic error,
+    it attempts to delete and recreate it.
+    """
+    client = get_chroma_client()
+    try:
+        # Health check: try to fetch 1 item
+        collection = client.get_collection(name=name)
+        collection.peek(limit=1)
+        return collection
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Collection '{name}' health check failed: {e}. Attempting auto-recreation...")
+        
+        try:
+            delete_collection(name)
+            return client.create_collection(
+                name=name,
+                metadata={"hnsw:space": "cosine"}
+            )
+        except Exception as recreate_err:
+            logger.error(f"Auto-recreation failed for '{name}': {recreate_err}")
+            raise RuntimeError(f"Critical Chroma failure: Collection '{name}' is corrupt and cannot be recreated.") from recreate_err

@@ -16,7 +16,7 @@ Use this checklist to ensure your deployment is complete and working.
 - [ ] `AZURE_OPENAI_API_KEY` - Set in Render
 - [ ] `AZURE_OPENAI_ENDPOINT` - Set in Render
 - [ ] `AZURE_OPENAI_API_VERSION` - Set in Render (or use default)
-- [ ] `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` - Set in Render
+- [ ] `AZURE_OPENAI_LARGE_CHAT_DEPLOYMENT_NAME` - Set in Render
 - [ ] `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME` - Set in Render
 
 ### Azure Blob Storage

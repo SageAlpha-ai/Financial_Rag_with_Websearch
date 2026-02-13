@@ -190,7 +190,7 @@ This project is ready for **one-click deployment on Render.com**.
    - `AZURE_OPENAI_API_KEY` - Your Azure OpenAI API key
    - `AZURE_OPENAI_ENDPOINT` - Your Azure OpenAI endpoint (e.g., `https://your-resource.openai.azure.com/`)
    - `AZURE_OPENAI_API_VERSION` - API version (e.g., `2024-12-01-preview`)
-   - `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` - Chat deployment name (e.g., `gpt-4`)
+   - `AZURE_OPENAI_LARGE_CHAT_DEPLOYMENT_NAME` - Chat deployment name (e.g., `gpt-4`)
    - `AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME` - Embeddings deployment name (e.g., `text-embedding-3-large`)
    
    **Azure Blob Storage:**
@@ -201,7 +201,7 @@ This project is ready for **one-click deployment on Render.com**.
    - `CHROMA_API_KEY` - Chroma Cloud API key
    - `CHROMA_TENANT` - Chroma Cloud tenant ID
    - `CHROMA_DATABASE` - Chroma Cloud database name
-   - `CHROMA_COLLECTION_NAME` - Collection name (default: `compliance`)
+   - `CHROMA_COLLECTION_NAME` - Collection name (default: `default`)
    
    **SerpAPI (Optional):**
    - `SERP_API_KEY` - SerpAPI key for web search

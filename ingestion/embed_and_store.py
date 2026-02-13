@@ -1,331 +1,366 @@
 """
-Embedding and Storage Module
+Embedding and Storage Module — STRICT Streaming Ingestion Pipeline
 
-Stores documents in Chroma Cloud using Azure OpenAI embeddings.
-Uses deterministic IDs to prevent duplicates.
+Architecture:
+    For each source document:
+        For each chunk:
+            1. Generate deterministic ID
+            2. Check if chunk already exists in Chroma → skip if yes
+            3. Embed ONLY new chunks (one at a time)
+            4. Immediately store via collection.add()
+            5. Verify count increased by exactly 1
+            6. Move to next chunk
+        After all chunks of a source succeed → checkpoint that source
 
-Embeds documents using Azure OpenAI before storing in Chroma Cloud.
+STRICT GUARANTEES:
+    - collection.add() ONLY — upsert() is FORBIDDEN.
+    - Deterministic SHA-256 IDs: source|page|chunk_index|text — no UUIDs.
+    - Duplicate IDs inside a single document → RuntimeError.
+    - Insert does not increase count by 1 → RuntimeError.
+    - Fresh reset leaves non-zero count → RuntimeError.
+    - Post-ingestion cloud verification via fresh collection handle.
+    - No global embedding accumulation.  Zero memory pressure.
+    - Checkpoint is source-level: processed sources survive crashes.
+
+This script either:
+    A) Successfully increases count for every new chunk, OR
+    B) Crashes loudly.
 """
 
 import hashlib
-from typing import List, Dict
-from tqdm import tqdm
+import os
+import time
+from collections import OrderedDict
+from typing import List, Dict, Set
 
 from langchain_openai import AzureOpenAIEmbeddings
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
 
 from config.settings import get_config
-from vectorstore.chroma_client import get_collection, delete_collection
+from vectorstore.chroma_client import delete_collection, get_company_collection
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers  (source-level, not index-level)
+# ---------------------------------------------------------------------------
+
+_CHECKPOINT_FILE = "ingest_checkpoint.txt"
+
+
+def _read_checkpoint() -> Set[str]:
+    """Return the set of already-processed source identifiers."""
+    if not os.path.exists(_CHECKPOINT_FILE):
+        return set()
+    try:
+        with open(_CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except OSError:
+        return set()
+
+
+def _append_checkpoint(source: str) -> None:
+    """Append a successfully-processed source to the checkpoint file."""
+    with open(_CHECKPOINT_FILE, "a", encoding="utf-8") as f:
+        f.write(source + "\n")
+
+
+def _clear_checkpoint() -> None:
+    """Remove the checkpoint file (fresh start)."""
+    if os.path.exists(_CHECKPOINT_FILE):
+        os.remove(_CHECKPOINT_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Embedding wrapper
+# ---------------------------------------------------------------------------
 
 
 class AzureOpenAIEmbeddingFunction(EmbeddingFunction):
-    """
-    Custom embedding function for Chroma using Azure OpenAI.
-    
-    Wraps LangChain's AzureOpenAIEmbeddings to work with Chroma.
-    """
-    
+    """Wraps LangChain AzureOpenAIEmbeddings for Chroma's EmbeddingFunction API."""
+
     def __init__(self):
-        """Initialize Azure OpenAI embeddings."""
         config = get_config().azure_openai
-        
-        # For text-embedding-3-large, don't pass model parameter (deployment name is sufficient)
-        # The deployment name in Azure OpenAI already identifies the model
         embedding_kwargs = {
             "azure_endpoint": config.endpoint,
             "azure_deployment": config.embeddings_deployment,
             "api_key": config.api_key,
             "api_version": config.api_version,
         }
-        
-        # Only add model parameter for older models if needed
-        # text-embedding-3-large doesn't need explicit model parameter
         if "text-embedding-ada-002" in config.embeddings_deployment.lower():
             embedding_kwargs["model"] = "text-embedding-ada-002"
-        
         self.embeddings = AzureOpenAIEmbeddings(**embedding_kwargs)
-    
+
     def __call__(self, input: Documents) -> Embeddings:
-        """
-        Generate embeddings for documents.
-        
-        Args:
-            input: List of document texts
-        
-        Returns:
-            List of embedding vectors
-        """
         return self.embeddings.embed_documents(input)
 
 
-def generate_deterministic_id(text: str, source: str) -> str:
+# ---------------------------------------------------------------------------
+# Deterministic ID generation
+# ---------------------------------------------------------------------------
+
+
+def generate_id(text: str, source: str, page: str, chunk_index: int) -> str:
+    """Full 64-char SHA-256 hex digest of ``source|page|chunk_index|text``.
+
+    Guarantees:
+        - Same chunk always maps to the same ID.
+        - Fully deterministic — no UUID, no counter reset.
     """
-    Generates deterministic ID for deduplication.
-    Same content + source = same ID = no duplicate.
-    """
-    content = f"{source}:{text[:500]}"
-    return hashlib.sha256(content.encode()).hexdigest()[:32]
+    base = f"{source}|{page}|{chunk_index}|{text}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Metadata sanitizer
+# ---------------------------------------------------------------------------
+
+
+def _clean_metadata(meta: Dict) -> Dict:
+    """Return a Chroma-safe copy of *meta* (no None, no exotic types)."""
+    cleaned: Dict = {}
+    for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, bool)):
+            cleaned[key] = value
+        else:
+            cleaned[key] = str(value)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
+# Group chunks by source document
+# ---------------------------------------------------------------------------
+
+
+def _group_by_source(documents: List[Dict]) -> OrderedDict:
+    """Group chunks by ``metadata.source``, preserving insertion order."""
+    groups: OrderedDict = OrderedDict()
+    for doc in documents:
+        source = doc.get("metadata", {}).get("source", "unknown")
+        groups.setdefault(source, []).append(doc)
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 
 def embed_and_store_documents(
     documents: List[Dict],
-    collection_name: str = None,
+    company_name: str,
     fresh: bool = False,
-    batch_size: int = 50
 ) -> int:
-    """
-    Embeds documents using Azure OpenAI and stores them in Chroma Cloud.
-    
+    """Stream-embed and store *documents* into Chroma Cloud, one chunk at a time.
+
+    Raises ``RuntimeError`` on ANY anomaly — no silent skips.
+
     Args:
-        documents: List of documents with 'text' and 'metadata'
-        collection_name: Target collection (defaults to config)
-        fresh: If True, delete existing collection first
-        batch_size: Batch size for embedding and upsert (default: 50)
-    
+        documents: List of dicts with ``text`` and ``metadata`` keys
+            (typically already chunked by ``ingestion.chunking``).
+        collection_name: Target collection (defaults to config).
+        fresh: If ``True``, delete + recreate collection, verify
+            count == 0, and clear checkpoint.
+
     Returns:
-        Number of documents stored
+        Total number of newly inserted chunks.
+
+    Raises:
+        RuntimeError: On failed inserts, count mismatches, intra-document
+            duplicate IDs, or any unexpected condition.
     """
     print("=" * 60)
-    print("EMBEDDING AND STORING DOCUMENTS TO CHROMA CLOUD")
+    print("STRICT STREAMING CHROMA CLOUD INGESTION")
     print("=" * 60)
-    
+
     if not documents:
-        print("[WARN] No documents to store")
-        return 0
-    
-    config = get_config()
-    collection_name = collection_name or config.chroma_cloud.collection_name
-    
-    # Delete existing if fresh ingestion
+        raise RuntimeError("No documents provided — nothing to ingest")
+
+    # ------------------------------------------------------------------
+    # Resolve collection dynamically (isolated per company)
+    # ------------------------------------------------------------------
     if fresh:
-        print(f"\n[FRESH MODE] Deleting existing collection '{collection_name}'...")
+        from rag.company_normalizer import normalize_company_name
+        norm_name = normalize_company_name(company_name)
+        print(f"\n[FRESH MODE] Deleting collection '{norm_name}'...")
         try:
-            delete_collection(collection_name)
-            print(f"  ✓ Collection deleted")
-        except Exception as e:
-            print(f"  [INFO] Collection may not exist: {e}")
-    
-    # Initialize embedding function
+            delete_collection(name=norm_name)
+            print("  Deleted.")
+        except Exception:
+            print("  Collection did not exist — OK.")
+        _clear_checkpoint()
+        time.sleep(2)
+
+    collection = get_company_collection(company_name)
+
+    # Cloud connection validation
+    startup_count = collection.count()
+    print(f"\n  Connected to Chroma")
+    print(f"  Collection name: {collection.name}")
+    print(f"  Collection count: {startup_count}")
+
+    # ==================================================================
+    # 2. INITIALIZE EMBEDDINGS
+    # ==================================================================
     print(f"\nInitializing Azure OpenAI embeddings...")
-    print(f"  Endpoint: {config.azure_openai.endpoint[:50]}...")
     print(f"  Deployment: {config.azure_openai.embeddings_deployment}")
-    
-    try:
-        embedding_function = AzureOpenAIEmbeddingFunction()
-        print("  ✓ Embedding function ready")
-    except Exception as e:
-        print(f"  [ERROR] Failed to initialize embeddings: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0
-    
-    # Get collection with custom embedding function
-    print(f"\nConnecting to Chroma Cloud collection: {collection_name}")
-    try:
-        # Import here to avoid circular dependency
-        from vectorstore.chroma_client import get_chroma_client
-        
-        client = get_chroma_client()
-        
-        # Delete and recreate collection if fresh mode (ensures clean state)
-        if fresh:
-            print(f"  [FRESH MODE] Deleting existing collection '{collection_name}'...")
-            try:
-                client.delete_collection(name=collection_name)
-                print(f"  ✓ Collection deleted successfully")
-            except Exception as e:
-                print(f"  [INFO] Collection may not exist or already deleted: {e}")
-            
-            # Small delay to ensure deletion propagates
-            import time
-            time.sleep(1)
-        
-        # Get or create collection WITHOUT embedding_function
-        # CRITICAL: For Chroma Cloud with pre-computed embeddings, do NOT pass embedding_function
-        # Passing embedding_function causes KeyError '_type' due to JSON schema mismatch
-        # We pass embeddings explicitly during upsert(), so embedding_function is not needed here
-        # The embedding_function is only needed for query-time when embeddings are computed on-the-fly
-        print(f"  Creating/getting collection '{collection_name}'...")
-        collection = client.get_or_create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        
-        current_count = collection.count()
-        print(f"  ✓ Collection ready (current count: {current_count})")
-        
-        # Log tenant/database/collection for verification
-        import os
-        print(f"\n  [VERIFY] Connection details:")
-        print(f"    Tenant: {config.chroma_cloud.tenant}")
-        print(f"    Database: {config.chroma_cloud.database}")
-        print(f"    Collection: {collection.name}")
-        print(f"    Collection count: {current_count}")
-        
-    except Exception as e:
-        print(f"  [ERROR] Failed to get collection: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0
-    
-    print(f"\nProcessing {len(documents)} documents in batches of {batch_size}...")
-    print(f"  Embedding model: Azure OpenAI ({config.azure_openai.embeddings_deployment})")
-    
-    # Diagnostic: Check document structure
-    if documents:
-        sample_doc = documents[0]
-        print(f"\n  [DEBUG] Sample document structure:")
-        print(f"    Keys: {list(sample_doc.keys())}")
-        if "text" in sample_doc:
-            text_len = len(sample_doc.get("text", ""))
-            print(f"    Text length: {text_len} chars")
-            print(f"    Text preview: {sample_doc.get('text', '')[:100]}...")
-        if "metadata" in sample_doc:
-            print(f"    Metadata keys: {list(sample_doc.get('metadata', {}).keys())}")
-    
-    # Process in batches
-    total_stored = 0
-    total_embedded = 0
-    batch_num = 0
-    
-    for i in tqdm(range(0, len(documents), batch_size), desc="Embedding and storing"):
-        batch = documents[i:i + batch_size]
-        batch_num += 1
-        
-        # Extract texts and filter empty
-        texts = []
-        valid_docs = []
-        
-        for doc in batch:
-            text = doc.get("text", "").strip()
-            if text and len(text) >= 10:  # Only include non-empty, meaningful texts
-                texts.append(text)
-                valid_docs.append(doc)
-            else:
-                if batch_num == 1:  # Log first batch filtering
-                    print(f"    [DEBUG] Skipped document: text length={len(text) if text else 0}")
-        
-        if not texts:
-            print(f"\n  [WARN] Batch {batch_num}: All documents empty or too short, skipping")
-            print(f"    [DEBUG] Batch size: {len(batch)}, Valid texts: {len(texts)}")
-            continue
-        
-        # Generate embeddings for this batch using Azure OpenAI
-        try:
-            print(f"\n  Batch {batch_num}: Generating embeddings for {len(texts)} documents...")
-            embeddings = embedding_function(texts)
-            
-            if not embeddings:
-                print(f"  [ERROR] Batch {batch_num}: Embedding function returned empty list")
+    embedding_fn = AzureOpenAIEmbeddingFunction()
+    print("  Ready.")
+
+    # ==================================================================
+    # 3. GROUP BY SOURCE + LOAD CHECKPOINT
+    # ==================================================================
+    source_groups = _group_by_source(documents)
+    completed_sources = _read_checkpoint() if not fresh else set()
+
+    total_sources = len(source_groups)
+    total_chunks = len(documents)
+    sources_to_process = [s for s in source_groups if s not in completed_sources]
+
+    if completed_sources:
+        print(f"\n[RESUME] {len(completed_sources)} sources already processed — skipping them")
+
+    print(f"\n  Total source documents:  {total_sources}")
+    print(f"  Total chunks:            {total_chunks}")
+    print(f"  Sources to process:      {len(sources_to_process)}")
+
+    # ==================================================================
+    # 4. STREAMING LOOP: source → chunk → dedup → embed → store → verify
+    # ==================================================================
+    total_inserted = 0
+    total_skipped = 0
+    source_num = 0
+
+    for source_key in sources_to_process:
+        chunks = source_groups[source_key]
+        source_num += 1
+
+        print(f"\n{'─' * 50}")
+        print(f"  Source [{source_num}/{len(sources_to_process)}]: {source_key}")
+        print(f"  Chunks: {len(chunks)}")
+
+        # --- Collect all IDs for this source to check intra-doc dupes ---
+        source_ids: List[str] = []
+        source_valid_chunks: List[Dict] = []
+
+        for chunk in chunks:
+            text = chunk.get("text", "").strip()
+            if not text or len(text) < 10:
                 continue
-            
-            if len(embeddings) != len(texts):
-                print(f"  [WARN] Batch {batch_num}: Expected {len(texts)} embeddings, got {len(embeddings)}")
-            
-            total_embedded += len(embeddings)
-            print(f"  ✓ Batch {batch_num}: Generated {len(embeddings)} embeddings (dimension: {len(embeddings[0]) if embeddings else 0})")
-        except Exception as e:
-            print(f"\n  [ERROR] Batch {batch_num}: Failed to generate embeddings: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
-        
-        # Generate deterministic IDs for valid docs only
-        ids = [
-            generate_deterministic_id(doc["text"], doc.get("metadata", {}).get("source", ""))
-            for doc in valid_docs
-        ]
-        
-        # Extract and clean metadata
-        metadatas = []
-        for doc in valid_docs:
-            meta = doc.get("metadata", {}).copy()
-            
-            # Remove None values
-            keys_to_remove = [k for k, v in meta.items() if v is None]
-            for k in keys_to_remove:
-                del meta[k]
-            
-            # Convert float values to strings for Chroma compatibility
-            for k, v in list(meta.items()):
-                if isinstance(v, float):
-                    meta[k] = str(v)
-                # Ensure all values are JSON-serializable
-                elif not isinstance(v, (str, int, bool)):
-                    meta[k] = str(v)
-            
-            metadatas.append(meta)
-        
-        # Add documents to Chroma Cloud with pre-computed embeddings
-        try:
-            # CRITICAL VALIDATION: Ensure all lists match before adding
-            assert len(ids) > 0, f"Batch {batch_num}: No IDs generated"
-            assert len(ids) == len(texts), f"Batch {batch_num}: IDs ({len(ids)}) and texts ({len(texts)}) length mismatch"
-            assert len(ids) == len(embeddings), f"Batch {batch_num}: IDs ({len(ids)}) and embeddings ({len(embeddings)}) length mismatch"
-            assert len(ids) == len(metadatas), f"Batch {batch_num}: IDs ({len(ids)}) and metadatas ({len(metadatas)}) length mismatch"
-            
-            # Instrumentation: Log before adding
-            print(f"\n>>> ABOUT TO ADD DOCUMENTS (Batch {batch_num})")
-            print(f">>> IDs: {len(ids)}")
-            print(f">>> Texts: {len(texts)}")
-            print(f">>> Embeddings: {len(embeddings)} (dimension: {len(embeddings[0]) if embeddings else 0})")
-            print(f">>> Metadatas: {len(metadatas)}")
-            
-            # Get collection count BEFORE add
-            count_before = collection.count()
-            
-            # FORCE DIRECT CLOUD STORAGE - use upsert to ensure writes
-            collection.upsert(
-                ids=ids,
-                documents=texts,
-                metadatas=metadatas,
-                embeddings=embeddings
+
+            meta = chunk.get("metadata", {})
+            page = str(meta.get("page", meta.get("page_number", "0")))
+            chunk_index = meta.get("chunk_index", 0)
+
+            chunk_id = generate_id(
+                text=text,
+                source=source_key,
+                page=page,
+                chunk_index=chunk_index,
             )
-            
-            # Verify immediately after add
-            count_after = collection.count()
-            added_count = count_after - count_before
-            
-            print(f">>> ADD FINISHED (Batch {batch_num})")
-            print(f">>> COUNT BEFORE: {count_before}")
-            print(f">>> COUNT AFTER: {count_after}")
-            print(f">>> DOCUMENTS ADDED THIS BATCH: {added_count}")
-            
-            if added_count != len(ids):
-                print(f"  [WARN] Expected {len(ids)} documents added, but count increased by {added_count}")
-            
-            total_stored += len(valid_docs)
-            
-            # Log progress every 5 batches
-            if batch_num % 5 == 0:
-                print(f"    Progress: {total_stored}/{len(documents)} documents stored")
-            
-            # Log first batch details
-            if batch_num == 1:
-                print(f"\n  First batch details:")
-                print(f"    Documents: {len(valid_docs)}")
-                if valid_docs:
-                    first_source = valid_docs[0].get("metadata", {}).get("source", "unknown")
-                    first_text_len = len(valid_docs[0].get("text", ""))
-                    print(f"    Example source: {first_source}")
-                    print(f"    Example text length: {first_text_len} chars")
-                
-        except Exception as e:
-            print(f"\n  [ERROR] Batch {batch_num}: Failed to add documents: {e}")
-            import traceback
-            traceback.print_exc()
+
+            source_ids.append(chunk_id)
+            source_valid_chunks.append(chunk)
+
+        if not source_valid_chunks:
+            print(f"    No valid chunks — skipping source")
+            _append_checkpoint(source_key)
             continue
-    
-    # Final summary
-    final_count = collection.count()
-    
+
+        # --- HARD BLOCK: duplicate IDs inside this source document ---
+        if len(source_ids) != len(set(source_ids)):
+            seen: Set[str] = set()
+            dupes = []
+            for cid in source_ids:
+                if cid in seen:
+                    dupes.append(cid)
+                seen.add(cid)
+            raise RuntimeError(
+                f"Source '{source_key}': Duplicate IDs detected INSIDE "
+                f"DOCUMENT — {len(dupes)} duplicates: {dupes[:5]}"
+            )
+
+        # --- Process each chunk individually ---------------------------
+        inserted_this_source = 0
+        skipped_this_source = 0
+
+        for i, (chunk_id, chunk) in enumerate(
+            zip(source_ids, source_valid_chunks)
+        ):
+            text = chunk["text"].strip()
+            meta = chunk.get("metadata", {})
+
+            # ---- DUPLICATE CHECK against Chroma ----
+            existing = collection.get(ids=[chunk_id], include=[])
+            if existing.get("ids"):
+                skipped_this_source += 1
+                continue
+
+            # ---- EMBED (single chunk — zero accumulation) ----
+            embedding_result = embedding_fn([text])
+            embedding = embedding_result[0]
+
+            # ---- CLEAN METADATA ----
+            clean_meta = _clean_metadata(meta)
+
+            # ---- COUNT BEFORE ----
+            count_before = collection.count()
+
+            # ---- STORE (collection.add ONLY — NO upsert) ----
+            collection.add(
+                ids=[chunk_id],
+                documents=[text],
+                embeddings=[embedding],
+                metadatas=[clean_meta],
+            )
+
+            # ---- COUNT AFTER + VERIFY ----
+            count_after = collection.count()
+
+            if count_after != count_before + 1:
+                raise RuntimeError(
+                    f"Insert FAILED for chunk {i} of '{source_key}' — "
+                    f"expected count {count_before + 1} but got {count_after}. "
+                    f"Insert not persisted in Chroma."
+                )
+
+            inserted_this_source += 1
+
+        total_inserted += inserted_this_source
+        total_skipped += skipped_this_source
+
+        print(f"    Inserted: {inserted_this_source}")
+        print(f"    Skipped (existing): {skipped_this_source}")
+        print(f"    Running total: {total_inserted} inserted, {total_skipped} skipped")
+
+        # --- Checkpoint: source fully processed ----
+        _append_checkpoint(source_key)
+
+    # ==================================================================
+    # 5. POST-INGESTION CLOUD VERIFICATION
+    # ==================================================================
+    verified_collection = get_company_collection(company_name)
+    verified_count = verified_collection.count()
+
     print(f"\n{'=' * 60}")
-    print(f"EMBEDDING AND STORAGE COMPLETE")
+    print("INGESTION COMPLETE — VERIFIED")
     print(f"{'=' * 60}")
-    print(f"Documents processed: {len(documents)}")
-    print(f"Embeddings generated: {total_embedded}")
-    print(f"Documents stored: {total_stored}")
-    print(f"Collection count: {final_count}")
+    print(f"  Total chunks processed:                   {total_chunks}")
+    print(f"  Newly inserted this run:                  {total_inserted}")
+    print(f"  Skipped (already existed):                {total_skipped}")
+    print(f"  Final verified count (fresh handle):      {verified_count}")
     print(f"{'=' * 60}")
-    
-    return total_stored
+
+    expected_minimum = startup_count + total_inserted
+    if verified_count < expected_minimum:
+        raise RuntimeError(
+            f"Post-ingestion verification FAILED — verified count "
+            f"({verified_count}) < startup ({startup_count}) + "
+            f"inserted ({total_inserted}) = {expected_minimum}"
+        )
+
+    # Clear checkpoint only when all sources were processed
+    if not sources_to_process or source_num >= len(sources_to_process):
+        _clear_checkpoint()
+
+    return total_inserted

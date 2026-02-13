@@ -13,13 +13,16 @@ from openai import AzureOpenAI
 from config.settings import get_config
 
 
-# Finance-grade system prompt
+# Finance-grade system prompt (document-grounded RAG mode only).
+# Assumes Tier-1 answerability has already validated that the provided
+# documents are relevant and sufficient.  This prompt must NEVER instruct
+# the model to guess, estimate, or fall back to general knowledge.
 FINANCIAL_SYSTEM_PROMPT = """You are a financial analysis assistant. You MUST follow these rules:
 
 STRICT RULES FOR FINANCIAL QUESTIONS:
-1. Only answer using EXPLICITLY STATED values from the retrieved documents.
-2. If a value is not present in the documents, say "Not available in the retrieved documents."
-3. NEVER guess or calculate values not explicitly provided.
+1. ALL financial values, figures, and metrics MUST come from the provided documents.
+2. Do NOT guess, estimate, extrapolate, or use general knowledge for any financial figure.
+3. If required financial data is not present in the documents, state that the information is not available in the provided sources.
 4. If financial data belongs to a SUBSIDIARY, do NOT attribute it to the parent company unless explicitly stated.
 
 REQUIRED FORMAT FOR FINANCIAL ANSWERS:
@@ -40,8 +43,9 @@ ADDITIONAL RULES:
 - Always include the YEAR when citing financial figures
 - Always include the CURRENCY and UNIT
 - If year or unit is unclear, state: "Year/unit not clearly specified in the source document."
+- If a requested metric is absent from the documents, explicitly state: "This metric is not available in the provided sources."
 
-For non-financial questions, answer normally in clear paragraphs.
+For non-financial questions, answer normally in clear paragraphs using only the provided documents.
 """
 
 
@@ -97,7 +101,7 @@ def build_rag_prompt(query: str, documents: List[str], metadatas: List[Dict]) ->
 Retrieved Documents:
 {context_text}
 
-Remember: For financial questions, use the structured format. Include entity, year, currency, and unit."""}
+Answer using ONLY the information in the documents above. For financial questions, use the structured format. Include entity, year, currency, and unit. If a requested value is not present in the documents, state that it is not available."""}
     ]
 
 
@@ -166,7 +170,7 @@ def format_rag_response(
     messages = build_rag_prompt(query, documents, metadatas)
     
     response = client.chat.completions.create(
-        model=config.azure_openai.chat_deployment,
+        model=config.azure_openai.large_chat_deployment,
         messages=messages,
         temperature=0,
     )
@@ -193,7 +197,7 @@ def format_llm_fallback_response(query: str) -> str:
     messages = build_llm_prompt(query)
     
     response = client.chat.completions.create(
-        model=config.azure_openai.chat_deployment,
+        model=config.azure_openai.large_chat_deployment,
         messages=messages,
         temperature=0.3,
     )

@@ -1,8 +1,16 @@
 """
 Company Name Validator
 
-Validates that retrieved documents match the company mentioned in the query.
-Prevents cross-company contamination.
+NEUTRALIZED — retained for legacy compatibility only.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Company validation is enforced upstream by Tier-1 guardrails
+(``langchain_orchestrator._is_answerable``) and evidence-fusion
+consistency filters (``evidence_fusion.fuse_evidence``).  This
+module is retained so that existing call-sites continue to compile,
+but it must NEVER filter, reject, or accept documents.
+
+The public method ``validate_company_match`` returns all inputs
+unchanged.  Helper methods are left intact but unused.
 """
 
 import logging
@@ -22,40 +30,25 @@ class CompanyValidator:
         metadatas: List[Dict]
     ) -> Tuple[List[str], List[Dict], List[str]]:
         """
-        Filter documents to only include those matching the company in query.
-        
+        Legacy company-match filter — intentionally neutralized.
+
+        Returns all documents unchanged.  Company/entity validation is
+        enforced upstream by Tier-1 guardrails in
+        ``langchain_orchestrator._is_answerable`` and by the
+        evidence-fusion consistency filter.  This method must never
+        filter, reject, or accept documents on its own.
+
         Args:
             query: User query
             documents: Retrieved documents
             metadatas: Document metadata
             
         Returns:
-            (filtered_documents, filtered_metadatas, rejected_reasons)
+            (documents, metadatas, [])  — always passes everything through
         """
-        query_company = CompanyValidator._extract_company_from_query(query)
-        
-        if not query_company:
-            # No company specified, return all documents
-            return documents, metadatas, []
-        
-        filtered_docs = []
-        filtered_metas = []
-        rejected = []
-        
-        for doc, meta in zip(documents, metadatas):
-            doc_company = CompanyValidator._extract_company_from_metadata(meta, doc)
-            
-            if CompanyValidator._companies_match(query_company, doc_company):
-                filtered_docs.append(doc)
-                filtered_metas.append(meta)
-            else:
-                rejected.append(f"Document company '{doc_company}' doesn't match query company '{query_company}'")
-                logger.warning(f"[VALIDATOR] Rejected document: {doc_company} != {query_company}")
-        
-        if rejected:
-            logger.info(f"[VALIDATOR] Filtered {len(rejected)} documents due to company mismatch")
-        
-        return filtered_docs, filtered_metas, rejected
+        # Intentionally bypassed: entity enforcement lives in Tier-1
+        # guardrails (_is_answerable) and evidence-fusion filters.
+        return documents, metadatas, []
     
     @staticmethod
     def _extract_company_from_query(query: str) -> Optional[str]:

@@ -2,6 +2,33 @@
 Query Classifier for SageAlpha AI
 
 Classifies queries to determine if they require verified sources.
+
+DEPRECATED — replaced by planner-based routing (rag/planner.py).
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+This module used regex keyword lists and numeric patterns to assign one of
+three hard-coded intents (greeting | general_knowledge | financial_document_query).
+It was the first decision gate in the legacy routing chain and had two
+structural limitations:
+
+  1. Keyword-only classification could not capture query *meaning* — e.g. an
+     ambiguous query with no financial keywords defaulted to
+     "financial_document_query", pushing it through the full RAG pipeline
+     unnecessarily.
+  2. The "requires_verified_source" flag was derived from the same keyword
+     lists, tightly coupling intent classification to evidence policy.
+
+The LLM-based planner (rag/planner.py) replaces this module by using a
+lightweight model (gpt-4o-mini) to semantically analyse the query and produce
+an explicit, ordered execution plan.  This removes all keyword lists,
+hard-coded intents, and regex patterns from the routing decision.
+
+This module is still imported under two conditions:
+  - When ENABLE_QUERY_PLANNER is false (legacy fallback in app.py)
+  - When the planner path raises an exception and the system falls back to
+    legacy routing in answer_query_simple()
+
+Do NOT delete until the planner has been validated in production and the
+ENABLE_QUERY_PLANNER flag is permanently enabled.
 """
 
 import logging
@@ -12,7 +39,11 @@ logger = logging.getLogger(__name__)
 
 
 class QueryClassifier:
-    """Classifies queries to determine evidence requirements and intent."""
+    """Classifies queries to determine evidence requirements and intent.
+
+    DEPRECATED — see module-level docstring.
+    Retained only for legacy fallback when ENABLE_QUERY_PLANNER is false.
+    """
     
     # Greeting patterns
     GREETING_PATTERNS = [
@@ -57,6 +88,11 @@ class QueryClassifier:
     def classify_query(query: str) -> Dict[str, any]:
         """
         Classify query to determine intent and evidence requirements.
+
+        .. deprecated::
+            Replaced by ``rag.planner.plan_query()``.  When the planner is
+            enabled, this method is never called.  It remains for legacy
+            fallback only.
         
         Returns:
             {
@@ -126,7 +162,10 @@ class QueryClassifier:
         elif is_general_knowledge:
             confidence = 0.8
         
-        requires_verified_source = is_factual_financial
+        # Evidence requirements are enforced by Tier-1 guardrails in
+        # langchain_orchestrator.  This classifier is informational only
+        # and must NEVER force factual answering or override evidence policy.
+        requires_verified_source = False
         
         logger.info(f"[CLASSIFIER] Intent: {intent}, factual_financial={is_factual_financial}, "
                    f"requires_source={requires_verified_source}, confidence={confidence:.2f}")
@@ -143,6 +182,15 @@ class QueryClassifier:
     
     @staticmethod
     def requires_verified_source(query: str) -> bool:
-        """Quick check if query requires verified source."""
-        classification = QueryClassifier.classify_query(query)
-        return classification["requires_verified_source"]
+        """Quick check if query requires verified source.
+
+        .. deprecated::
+            The planner decides evidence requirements semantically.
+            Retained for legacy fallback only.
+
+        Intentionally neutralized: always returns ``False``.
+        Evidence requirements are enforced exclusively by Tier-1
+        guardrails in ``langchain_orchestrator._is_answerable``.
+        This method must never influence answerability decisions.
+        """
+        return False

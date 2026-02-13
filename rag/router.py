@@ -5,8 +5,11 @@ Determines whether to use RAG (documents) or LLM fallback.
 Computes confidence scores based on retrieved content.
 """
 
+import logging
 import re
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def extract_year_from_query(query: str) -> Optional[str]:
@@ -103,13 +106,13 @@ def compute_rag_confidence(
         company = meta.get("company", "")
         entity_match = False
         
-        if requested_entity and company:
-            if requested_entity.lower() in company.lower() or company.lower() in requested_entity.lower():
+        if requested_entity:
+            if company and (requested_entity.lower() in company.lower() or company.lower() in requested_entity.lower()):
                 entity_matches += 1
                 entity_match = True
-        elif company:
-            entity_matches += 1
-            entity_match = True
+            else:
+                # Wrong-company document — contributes zero to all counters
+                continue
         
         # Year match
         doc_year = meta.get("fiscal_year", "")
@@ -165,6 +168,11 @@ def compute_rag_confidence(
         else:
             reason = "Insufficient matches in retrieved documents"
     
+    # Invariant: requested entity with zero matching documents forces RAG off
+    if requested_entity and entity_matches == 0:
+        use_rag = False
+        reason = f"Entity mismatch: no documents found matching {requested_entity}"
+    
     return {
         "use_rag": use_rag,
         "reason": reason,
@@ -179,6 +187,8 @@ def compute_rag_confidence(
     }
 
 
+# Routing decisions are advisory only; Tier-1 guardrails
+# (_is_answerable in langchain_orchestrator) determine answerability.
 def route_query(
     query: str,
     documents: List[str],
@@ -193,10 +203,10 @@ def route_query(
     confidence = compute_rag_confidence(query, documents, metadatas)
     
     if confidence["use_rag"]:
-        print(f"[Routing: RAG (confidence={confidence['total_score']}, {confidence['reason']})]")
+        logger.info("[ROUTER] Routing: RAG (confidence=%s, %s)", confidence["total_score"], confidence["reason"])
     else:
-        print(f"[Routing: LLM FALLBACK (confidence={confidence['total_score']}, {confidence['reason']})]")
+        logger.info("[ROUTER] Routing: LLM FALLBACK (confidence=%s, %s)", confidence["total_score"], confidence["reason"])
         if confidence["requested_year"]:
-            print(f"[Note: Requested year {confidence['requested_year']} not found in documents]")
+            logger.info("[ROUTER] Note: Requested year %s not found in documents", confidence["requested_year"])
     
     return confidence["use_rag"], confidence

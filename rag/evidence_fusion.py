@@ -6,10 +6,53 @@ Resolves conflicts and produces unified evidence for LLM summarization.
 """
 
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Query constraint extractors (lightweight, no LLM calls)
+# ---------------------------------------------------------------------------
+
+
+def _extract_fiscal_year(query: str) -> Optional[str]:
+    """Extract fiscal year from *query*. Returns ``FYxxxx`` or ``None``."""
+    patterns = [
+        r'FY\s*(\d{4})',
+        r'fiscal\s+year\s+(\d{4})',
+        r'\b(20\d{2})\b',
+        r'\b(19\d{2})\b',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            return f"FY{match.group(1)}"
+    return None
+
+
+def _extract_entity_from_query(query: str) -> Optional[str]:
+    """Extract company/entity from *query* using keyword matching."""
+    query_lower = query.lower()
+    entity_mappings = {
+        "oracle financial services": "Oracle Financial Services Software Ltd",
+        "oracle financial": "Oracle Financial Services Software Ltd",
+        "ofss": "Oracle Financial Services Software Ltd",
+        "microsoft": "Microsoft",
+        "apple": "Apple",
+        "google": "Google",
+        "amazon": "Amazon",
+        "meta": "Meta",
+        "facebook": "Meta",
+        "tesla": "Tesla",
+        "nvidia": "NVIDIA",
+    }
+    for key, value in entity_mappings.items():
+        if key in query_lower:
+            return value
+    return None
 
 
 class EvidenceFusion:
@@ -48,6 +91,98 @@ class EvidenceFusion:
         """
         logger.info(f"[FUSION] Fusing evidence: {len(rag_documents)} RAG docs, {len(web_documents)} web docs")
         
+        # ---------------------------------------------------------------- #
+        # Consistency filter                                                #
+        # Drop documents whose metadata contradicts the query's fiscal-year #
+        # or entity constraints.  This does NOT decide answerability — the  #
+        # Tier-1 guardrail (_is_answerable) remains authoritative.  This    #
+        # only prevents inconsistent evidence from reaching the LLM.        #
+        # ---------------------------------------------------------------- #
+        requested_year = _extract_fiscal_year(query)
+        requested_entity = _extract_entity_from_query(query)
+
+        if requested_year or requested_entity:
+            # --- Filter RAG documents ---
+            filtered_rag_docs: List[str] = []
+            filtered_rag_metas: List[Dict] = []
+            for doc, meta in zip(rag_documents, rag_metadatas):
+                dropped = False
+                doc_year = meta.get("fiscal_year", "")
+                doc_company = meta.get("company", "")
+
+                if (
+                    requested_year
+                    and doc_year
+                    and requested_year.lower() != doc_year.lower()
+                ):
+                    logger.info(
+                        "[FUSION] Dropped rag document: year mismatch "
+                        "(requested=%s, doc_year=%s, company=%s)",
+                        requested_year, doc_year, doc_company,
+                    )
+                    dropped = True
+
+                if not dropped and requested_entity and doc_company:
+                    if (
+                        requested_entity.lower() not in doc_company.lower()
+                        and doc_company.lower() not in requested_entity.lower()
+                    ):
+                        logger.info(
+                            "[FUSION] Dropped rag document: entity mismatch "
+                            "(requested=%s, doc_company=%s)",
+                            requested_entity, doc_company,
+                        )
+                        dropped = True
+
+                if not dropped:
+                    filtered_rag_docs.append(doc)
+                    filtered_rag_metas.append(meta)
+
+            # --- Filter web documents ---
+            filtered_web_docs: List[Dict] = []
+            for web_doc in web_documents:
+                dropped = False
+                doc_meta = web_doc.get("metadata", {})
+                doc_year = doc_meta.get("fiscal_year", "")
+                doc_company = doc_meta.get("company", "")
+
+                if (
+                    requested_year
+                    and doc_year
+                    and requested_year.lower() != doc_year.lower()
+                ):
+                    logger.info(
+                        "[FUSION] Dropped web document: year mismatch "
+                        "(requested=%s, doc_year=%s)",
+                        requested_year, doc_year,
+                    )
+                    dropped = True
+
+                if not dropped and requested_entity and doc_company:
+                    if (
+                        requested_entity.lower() not in doc_company.lower()
+                        and doc_company.lower() not in requested_entity.lower()
+                    ):
+                        logger.info(
+                            "[FUSION] Dropped web document: entity mismatch "
+                            "(requested=%s, doc_company=%s)",
+                            requested_entity, doc_company,
+                        )
+                        dropped = True
+
+                if not dropped:
+                    filtered_web_docs.append(web_doc)
+
+            # Rebind to filtered sets for the rest of the method
+            rag_documents = filtered_rag_docs
+            rag_metadatas = filtered_rag_metas
+            web_documents = filtered_web_docs
+
+            logger.info(
+                "[FUSION] After consistency filter: %d RAG docs, %d web docs",
+                len(rag_documents), len(web_documents),
+            )
+
         # Prioritize web documents (official sources)
         prioritized_docs = []
         sources = []

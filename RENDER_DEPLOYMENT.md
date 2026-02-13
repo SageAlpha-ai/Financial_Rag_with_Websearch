@@ -46,7 +46,7 @@ In Render dashboard, go to **Environment** tab and add:
 AZURE_OPENAI_API_KEY=your_azure_openai_key
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
-AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=gpt-4
+AZURE_OPENAI_LARGE_CHAT_DEPLOYMENT_NAME=gpt-4
 AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME=text-embedding-3-large
 ```
 
@@ -61,7 +61,7 @@ AZURE_BLOB_CONTAINER_NAME=your-container-name
 CHROMA_API_KEY=your_chroma_api_key
 CHROMA_TENANT=your_tenant_id
 CHROMA_DATABASE=your_database_name
-CHROMA_COLLECTION_NAME=compliance
+CHROMA_COLLECTION_NAME=default
 ```
 
 **SerpAPI (Optional - for web search):**

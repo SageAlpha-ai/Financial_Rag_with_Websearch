@@ -14,29 +14,92 @@ Swagger UI:
     http://localhost:8000/docs
 """
 
+import json
 import logging
 import os
 import sys
+import uuid
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+from datetime import datetime
 
 # Add current directory to path for imports
 sys.path.insert(0, ".")
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Import existing logic
 from config.settings import get_config, validate_config
 # LangChain orchestration replaces manual routing
-from rag.langchain_orchestrator import answer_query_simple
+from rag.langchain_orchestrator import answer_query_simple, set_debug_request, set_request_id
 # Report generation for long-format reports
 from rag.report_generator import is_report_request, generate_report
+# Ingestion modules
+from ingestion.azure_blob_loader import load_azure_documents
+from ingestion.chunking import chunk_documents
+from ingestion.embed_and_store import embed_and_store_documents
+from ingestion.incremental_ingestion import ingest_incremental
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+class JsonFormatter(logging.Formatter):
+    """Format log records as single-line JSON for machine parsing."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event_type = getattr(record, "event_type", record.getMessage())
+        log_record: Dict[str, Any] = {
+            "level": record.levelname,
+            "logger": record.name,
+            "event_type": event_type,
+            "message": record.getMessage(),
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+        }
+        # Include structured fields if present
+        for key in [
+            "execution_path",
+            "tools_executed",
+            "rag_doc_count",
+            "web_doc_count",
+            "adequacy_score",
+            "adequacy_decision",
+            "query",
+            "company",
+            "requested_year",
+            "answer_type",
+            "request_id",
+        ]:
+            if hasattr(record, key):
+                log_record[key] = getattr(record, key)
+        # Auto-inject request_id so all logs in request scope carry it
+        try:
+            from rag.langchain_orchestrator import get_request_id
+            rid = get_request_id()
+            if rid and "request_id" not in log_record:
+                log_record["request_id"] = rid
+        except Exception:
+            pass
+        try:
+            return json.dumps(log_record)
+        except TypeError:
+            safe_record = {k: str(v) for k, v in log_record.items()}
+            return json.dumps(safe_record)
+
+
+# Replace default handler formatter with JSON for structured logs
+_root = logging.getLogger()
+if _root.handlers:
+    _root.handlers[0].setFormatter(JsonFormatter())
+
+# Silence noisy third-party loggers that flood output at DEBUG/INFO level.
+# httpx / httpcore: log every HTTP request made by Azure OpenAI SDK.
+# chromadb: prints connection banners and internal diagnostics.
+for _noisy in ("httpx", "httpcore", "chromadb", "chromadb.telemetry"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 
 # ================================
@@ -259,6 +322,19 @@ class QueryRequest(BaseModel):
         examples=["What is the revenue of Oracle Financial Services for FY2023?"]
     )
     
+    deterministic: Optional[bool] = Field(
+        False,
+        description="Reserved (no-op). Retained for API backward compatibility."
+    )
+    mode: Optional[str] = Field(
+        "standard",
+        description="Reserved (no-op). Retained for API backward compatibility."
+    )
+    portfolio_context: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Reserved (no-op). Retained for API backward compatibility."
+    )
+    
     @model_validator(mode='after')
     def validate_at_least_one_field(self):
         """Ensure at least one of 'query' or 'question' is provided."""
@@ -278,8 +354,20 @@ class SourceItem(BaseModel):
     publisher: Optional[str] = Field(None, description="Publisher name (Company or Regulator)")
 
 
+class AuditMeta(BaseModel):
+    """Internal audit metadata (only present when debug mode is active)."""
+    tools_executed: List[str] = Field(default_factory=list)
+    execution_path: str = ""
+    temporal_override: bool = False
+    introspection_override: bool = False
+    domains_used: List[str] = Field(default_factory=list)
+
+
 class QueryResponse(BaseModel):
     """Response body for /query endpoint."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
     answer: str = Field(..., description="The generated answer")
     answer_type: str = Field(
         ...,
@@ -288,6 +376,19 @@ class QueryResponse(BaseModel):
     sources: List[SourceItem] = Field(
         default_factory=list,
         description="List of source documents with official URLs (empty list [] for LLM-only answers, never null)"
+    )
+    confidence_level: Optional[str] = Field(
+        None,
+        description="Confidence level: HIGH, MEDIUM, or LOW"
+    )
+    disclosure_note: Optional[str] = Field(
+        None,
+        description="Disclosure note about answer sourcing"
+    )
+    audit_meta: Optional[AuditMeta] = Field(
+        None,
+        alias="_meta",
+        description="Internal audit metadata (only present when DEBUG_MODE or X-Debug header is active)"
     )
 
 
@@ -325,11 +426,11 @@ def validate_azure_openai_deployments(config) -> None:
         logger.info("=" * 60)
         
         # Validate chat deployment
-        logger.info(f"Validating chat deployment: {config.azure_openai.chat_deployment}")
+        logger.info(f"Validating chat deployment: {config.azure_openai.large_chat_deployment}")
         try:
             test_llm = AzureChatOpenAI(
                 azure_endpoint=config.azure_openai.endpoint,
-                azure_deployment=config.azure_openai.chat_deployment,
+                azure_deployment=config.azure_openai.large_chat_deployment,
                 api_key=config.azure_openai.api_key,
                 api_version=config.azure_openai.api_version,
                 temperature=0.0,
@@ -338,24 +439,24 @@ def validate_azure_openai_deployments(config) -> None:
             )
             # Make a minimal test call
             test_llm.invoke("test")
-            logger.info(f"✓ Chat deployment '{config.azure_openai.chat_deployment}' is valid")
+            logger.info(f"✓ Chat deployment '{config.azure_openai.large_chat_deployment}' is valid")
         except Exception as e:
             error_msg = str(e)
             if "NotFound" in error_msg or "404" in error_msg or "deployment" in error_msg.lower():
                 raise ValueError(
-                    f"Azure OpenAI chat deployment '{config.azure_openai.chat_deployment}' not found.\n\n"
-                    f"This means the deployment name in AZURE_OPENAI_CHAT_DEPLOYMENT_NAME does not exist in your Azure OpenAI resource.\n\n"
+                    f"Azure OpenAI chat deployment '{config.azure_openai.large_chat_deployment}' not found.\n\n"
+                    f"This means the deployment name in AZURE_OPENAI_LARGE_CHAT_DEPLOYMENT_NAME does not exist in your Azure OpenAI resource.\n\n"
                     f"To fix:\n"
                     f"  1. Go to Azure Portal → Your OpenAI Resource → Deployments\n"
                     f"  2. Find the exact deployment name (case-sensitive)\n"
-                    f"  3. Update AZURE_OPENAI_CHAT_DEPLOYMENT_NAME in your .env file\n\n"
-                    f"Current value: {config.azure_openai.chat_deployment}\n"
+                    f"  3. Update AZURE_OPENAI_LARGE_CHAT_DEPLOYMENT_NAME in your .env file\n\n"
+                    f"Current value: {config.azure_openai.large_chat_deployment}\n"
                     f"Endpoint: {config.azure_openai.endpoint}\n\n"
                     f"Error: {error_msg}"
                 ) from e
             else:
                 raise ValueError(
-                    f"Failed to validate chat deployment '{config.azure_openai.chat_deployment}': {error_msg}"
+                    f"Failed to validate chat deployment '{config.azure_openai.large_chat_deployment}': {error_msg}"
                 ) from e
         
         # Validate embeddings deployment
@@ -437,41 +538,14 @@ async def lifespan(app: FastAPI):
                 logger.error("The application will not function correctly until deployments are fixed.")
                 # Allow health checks in local dev only
         
-        # Validate Chroma collection (non-blocking)
+        # Validate Chroma Dataset (non-blocking)
         try:
-            from vectorstore.chroma_client import get_collection
-            
-            # Auto-create in development mode
-            is_production = os.getenv("PYTHON_ENV") == "production" or os.getenv("AZURE_APP_SERVICE")
-            auto_create = os.getenv("CHROMA_AUTO_CREATE_COLLECTION", "").lower() == "true" or not is_production
-            
-            if auto_create:
-                logger.info("=" * 60)
-                logger.info("CHROMA COLLECTION VALIDATION (AUTO-CREATE MODE)")
-                logger.info("=" * 60)
-                collection = get_collection(create_if_missing=True)
-                doc_count = collection.count()
-                logger.info(f"Collection '{collection.name}' ready with {doc_count} documents")
-                if doc_count == 0:
-                    logger.warning("Collection is empty. Run 'python ingest.py --fresh' to populate it.")
-                logger.info("=" * 60)
-            else:
-                logger.info("=" * 60)
-                logger.info("CHROMA COLLECTION VALIDATION (STRICT MODE)")
-                logger.info("=" * 60)
-                try:
-                    collection = get_collection(create_if_missing=False)
-                    doc_count = collection.count()
-                    logger.info(f"Collection '{collection.name}' ready with {doc_count} documents")
-                    if doc_count == 0:
-                        logger.warning("Collection is empty. Run 'python ingest.py --fresh' to populate it.")
-                except ValueError as e:
-                    logger.warning(f"Collection validation: {str(e)}")
-                    logger.warning("Queries will fail until collection is created via ingestion.")
-                logger.info("=" * 60)
+            logger.info("=" * 60)
+            logger.info(f"Dataset: Developed in {config.chroma_cloud.database}")
+            logger.info("Dynamic collection resolution enabled")
+            logger.info("=" * 60)
         except Exception as e:
-            logger.warning(f"Chroma collection validation skipped: {e}")
-            logger.warning("Queries may fail if collection is not available.")
+            logger.warning(f"Chroma connection check failed: {e}")
         
     except ValueError as e:
         # Configuration error - fail fast with clear message
@@ -599,6 +673,263 @@ async def health_check():
     return {"status": "ok"}
 
 
+@app.get("/version", tags=["Info"])
+async def version():
+    """
+    Returns the application version from APP_VERSION environment variable.
+    Useful for verifying which Docker image version is running.
+    """
+    version = os.getenv("APP_VERSION", "unknown")
+    return {"version": version}
+
+
+# ================================
+# Ingestion Endpoints
+# ================================
+
+class IngestionResponse(BaseModel):
+    """Response model for ingestion endpoints."""
+    success: bool
+    message: str
+    documents_processed: int = 0
+    blobs_processed: int = 0
+    job_id: Optional[str] = None
+    error: Optional[str] = None
+
+
+# Track running ingestion jobs
+_ingestion_jobs: Dict[str, Dict] = {}
+
+
+def run_full_ingestion(fresh: bool = False):
+    """
+    Background task: Run full ingestion pipeline.
+    
+    Args:
+        fresh: If True, delete existing collection and re-ingest
+    """
+    job_id = f"ingest_{datetime.now().isoformat()}"
+    _ingestion_jobs[job_id] = {"status": "running", "started_at": datetime.now().isoformat()}
+    
+    try:
+        logger.info(f"[INGESTION JOB {job_id}] Starting full ingestion (fresh={fresh})")
+        
+        # Load Azure Blob documents
+        azure_docs = load_azure_documents()
+        
+        # Chunk documents
+        chunked_docs = chunk_documents(azure_docs)
+        logger.info(f"[INGESTION JOB {job_id}] Created {len(chunked_docs)} chunks")
+        
+        # Embed and store
+        stored_count = embed_and_store_documents(
+            documents=chunked_docs,
+            fresh=fresh,
+            batch_size=50
+        )
+        
+        _ingestion_jobs[job_id] = {
+            "status": "completed",
+            "started_at": _ingestion_jobs[job_id]["started_at"],
+            "completed_at": datetime.now().isoformat(),
+            "documents_processed": stored_count
+        }
+        
+        logger.info(f"[INGESTION JOB {job_id}] Completed: {stored_count} documents stored")
+    
+    except Exception as e:
+        logger.error(f"[INGESTION JOB {job_id}] Failed: {e}", exc_info=True)
+        _ingestion_jobs[job_id] = {
+            "status": "failed",
+            "started_at": _ingestion_jobs[job_id]["started_at"],
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e)
+        }
+
+
+def run_incremental_ingestion():
+    """
+    Background task: Run incremental ingestion (only new/updated documents).
+    """
+    job_id = f"incremental_{datetime.now().isoformat()}"
+    _ingestion_jobs[job_id] = {"status": "running", "started_at": datetime.now().isoformat()}
+    
+    try:
+        logger.info(f"[INGESTION JOB {job_id}] Starting incremental ingestion")
+        
+        result = ingest_incremental(fresh=False)
+        
+        _ingestion_jobs[job_id] = {
+            "status": "completed" if result.get("success") else "failed",
+            "started_at": _ingestion_jobs[job_id]["started_at"],
+            "completed_at": datetime.now().isoformat(),
+            **result
+        }
+        
+        logger.info(f"[INGESTION JOB {job_id}] Completed: {result.get('documents_processed', 0)} documents")
+    
+    except Exception as e:
+        logger.error(f"[INGESTION JOB {job_id}] Failed: {e}", exc_info=True)
+        _ingestion_jobs[job_id] = {
+            "status": "failed",
+            "started_at": _ingestion_jobs[job_id]["started_at"],
+            "completed_at": datetime.now().isoformat(),
+            "error": str(e)
+        }
+
+
+@app.post("/ingest", response_model=IngestionResponse, tags=["Ingestion"])
+async def trigger_ingestion(
+    fresh: bool = False,
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Trigger full ingestion of all documents from Azure Blob Storage.
+    
+    This endpoint:
+    1. Loads ALL documents from Azure Blob Storage
+    2. Chunks and embeds them
+    3. Stores them in Chroma Cloud
+    
+    Args:
+        fresh: If True, delete existing collection and re-ingest from scratch
+    
+    Returns:
+        Job ID and status (ingestion runs in background)
+    """
+    job_id = f"ingest_{datetime.now().isoformat()}"
+    
+    # Start background task
+    background_tasks.add_task(run_full_ingestion, fresh=fresh)
+    
+    return IngestionResponse(
+        success=True,
+        message="Ingestion job started",
+        job_id=job_id,
+        documents_processed=0,
+        blobs_processed=0
+    )
+
+
+@app.post("/ingest/incremental", response_model=IngestionResponse, tags=["Ingestion"])
+async def trigger_incremental_ingestion(
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Trigger incremental ingestion (only new or updated documents).
+    
+    This endpoint:
+    1. Checks Azure Blob Storage for new or updated blobs
+    2. Processes only new/updated documents
+    3. Embeds and stores them in Chroma Cloud
+    
+    This is the recommended endpoint for automated ingestion when new documents
+    are added to Azure Blob Storage.
+    
+    Returns:
+        Job ID and status (ingestion runs in background)
+    """
+    job_id = f"incremental_{datetime.now().isoformat()}"
+    
+    # Start background task
+    background_tasks.add_task(run_incremental_ingestion)
+    
+    return IngestionResponse(
+        success=True,
+        message="Incremental ingestion job started",
+        job_id=job_id,
+        documents_processed=0,
+        blobs_processed=0
+    )
+
+
+@app.get("/ingest/status/{job_id}", tags=["Ingestion"])
+async def get_ingestion_status(job_id: str):
+    """
+    Get status of an ingestion job.
+    
+    Args:
+        job_id: Job ID returned from /ingest or /ingest/incremental
+    
+    Returns:
+        Job status and results
+    """
+    if job_id not in _ingestion_jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    return _ingestion_jobs[job_id]
+
+
+@app.get("/ingest/jobs", tags=["Ingestion"])
+async def list_ingestion_jobs():
+    """
+    List all ingestion jobs (last 50).
+    
+    Returns:
+        List of job statuses
+    """
+    # Return last 50 jobs
+    jobs = list(_ingestion_jobs.items())[-50:]
+    return {
+        "total": len(_ingestion_jobs),
+        "jobs": {job_id: status for job_id, status in jobs}
+    }
+
+
+@app.post("/ingest/webhook", tags=["Ingestion"])
+async def azure_event_grid_webhook(
+    request: dict,
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Azure Event Grid webhook handler for blob storage events.
+    
+    This endpoint is called automatically by Azure Event Grid when:
+    - A new blob is created in the storage container
+    - A blob is updated
+    
+    Configure Azure Event Grid to call this endpoint:
+    1. Azure Portal → Storage Account → Events
+    2. Create Event Subscription
+    3. Event Types: Blob Created, Blob Deleted
+    4. Endpoint: Webhook → https://your-app.azurewebsites.net/ingest/webhook
+    
+    Returns:
+        Job ID and status
+    """
+    try:
+        # Azure Event Grid sends events in a specific format
+        event_type = request.get("eventType", "")
+        subject = request.get("subject", "")
+        
+        logger.info(f"[WEBHOOK] Received event: {event_type} for {subject}")
+        
+        # Only process blob creation/update events
+        if event_type in ["Microsoft.Storage.BlobCreated", "Microsoft.Storage.BlobRenamed"]:
+            # Trigger incremental ingestion
+            job_id = f"webhook_{datetime.now().isoformat()}"
+            background_tasks.add_task(run_incremental_ingestion)
+            
+            return {
+                "success": True,
+                "message": "Webhook received, incremental ingestion triggered",
+                "job_id": job_id,
+                "event_type": event_type,
+                "subject": subject
+            }
+        else:
+            logger.info(f"[WEBHOOK] Ignoring event type: {event_type}")
+            return {
+                "success": True,
+                "message": "Event received but not processed",
+                "event_type": event_type
+            }
+    
+    except Exception as e:
+        logger.error(f"[WEBHOOK] Error processing webhook: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {str(e)}")
+
+
 @app.get("/query", tags=["Query"])
 async def query_help():
     """
@@ -623,11 +954,23 @@ async def query_help():
     }
 
 
-async def _process_query(req: QueryRequest) -> QueryResponse:
+async def _process_query(
+    req: QueryRequest,
+    x_debug: Optional[str] = None,
+) -> QueryResponse:
     """
     Internal function to process RAG queries.
     Shared by both /query and /docs/query endpoints.
     """
+    from rag.telemetry import cost_tracker
+    cost_tracker.reset()
+
+    # Activate per-request debug mode when the X-Debug header is "true"
+    set_debug_request((x_debug or "").lower() == "true")
+
+    request_id = str(uuid.uuid4())
+    set_request_id(request_id)
+
     try:
         # Get input from request model (supports both 'query' and 'question' for backward compatibility)
         user_input = req.get_input()
@@ -648,55 +991,103 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
                 detail="Input could not be normalized. Please provide valid text input."
             )
         
+        logger.info(
+            "query_received",
+            extra={
+                "request_id": request_id,
+                "query": normalized_input,
+            },
+        )
         logger.info(f"[API] Processing query: {normalized_input[:100]}...")
         
-        # STEP 1: Classify query intent BEFORE routing
-        from rag.query_classifier import QueryClassifier
-        query_classification = QueryClassifier.classify_query(normalized_input)
-        intent = query_classification.get("intent", "financial_document_query")
-        
-        logger.info(f"[API] Query intent: {intent}")
-        
-        # STEP 2: Route based on intent
+        # ------------------------------------------------------------ #
+        # Feature flag: planner-driven routing                        #
+        # ------------------------------------------------------------ #
+        planner_enabled = os.getenv("ENABLE_QUERY_PLANNER", "false").lower() == "true"
+
         try:
-            if intent == "greeting":
-                # Greetings - use LLM-only WITHOUT RAG initialization
-                logger.info("[API] Greeting detected - using LLM-only mode (no RAG initialization)")
-                # Sanitize input to prevent Azure jailbreak detection
-                sanitized_input = sanitize_llm_input(normalized_input)
-                if sanitized_input != normalized_input:
-                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                from rag.langchain_orchestrator import get_llm_only_chain
-                llm_chain = get_llm_only_chain()
-                answer = llm_chain.invoke({"question": sanitized_input})
-                result = {
-                    "answer": answer,
-                    "answer_type": "llm_fallback",
-                    "sources": []
-                }
-            elif intent == "general_knowledge":
-                # General knowledge - use LLM-only WITHOUT RAG initialization
-                logger.info("[API] General knowledge query - using LLM-only mode (no RAG initialization)")
-                # Sanitize input to prevent Azure jailbreak detection
-                sanitized_input = sanitize_llm_input(normalized_input)
-                if sanitized_input != normalized_input:
-                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                from rag.langchain_orchestrator import get_llm_only_chain
-                llm_chain = get_llm_only_chain()
-                answer = llm_chain.invoke({"question": sanitized_input})
-                result = {
-                    "answer": answer,
-                    "answer_type": "llm_fallback",
-                    "sources": []
-                }
-            elif is_report_request(normalized_input):
-                # Long-format report generation (two-phase: RAG facts + LLM narrative)
-                logger.info("[API] Report generation mode detected")
-                result = generate_report(normalized_input)
+            if planner_enabled:
+                # Planner enabled — skip intent classification entirely.
+                # The planner decides tool selection for ALL query types.
+                logger.info("[API] Query planner ENABLED — bypassing intent classification")
+
+                if is_report_request(normalized_input):
+                    # Report requests are structural (multi-section), not a routing
+                    # concern — keep them on their dedicated path regardless.
+                    logger.info("[API] Report generation mode detected (planner active)")
+                    result = generate_report(normalized_input)
+                else:
+                    result = answer_query_simple(normalized_input)
+
             else:
-                # Financial document query - use RAG pipeline
-                logger.info("[API] Financial document query - using RAG pipeline")
-                result = answer_query_simple(normalized_input)
+                # ---------------------------------------------------------
+                # DEPRECATED — Legacy intent-based routing.
+                # This branch uses QueryClassifier (regex keyword matching)
+                # to assign one of three intents and then routes greetings
+                # and general-knowledge queries to an LLM-only chain,
+                # bypassing RAG entirely.  The planner replaces this by
+                # semantically analysing the query and producing an explicit
+                # execution plan that may include RAG, WEB_SEARCH, or
+                # LLM-only — without hard-coded intent categories.
+                # Retained for: rollback safety when ENABLE_QUERY_PLANNER
+                # is false, or when the planner path raises an exception.
+                # ---------------------------------------------------------
+                # STEP 1: Classify query intent BEFORE routing
+                from rag.query_classifier import QueryClassifier
+                query_classification = QueryClassifier.classify_query(normalized_input)
+                intent = query_classification.get("intent", "financial_document_query")
+
+                logger.info(f"[API] Query intent: {intent}")
+
+                # STEP 2: Route based on intent
+                if intent == "greeting":
+                    # Greetings - use LLM-only WITHOUT RAG initialization
+                    logger.info("[API] Greeting detected - using LLM-only mode (no RAG initialization)")
+                    # Sanitize input to prevent Azure jailbreak detection
+                    sanitized_input = sanitize_llm_input(normalized_input)
+                    if sanitized_input != normalized_input:
+                        logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
+                    from rag.langchain_orchestrator import get_llm_only_chain
+                    from rag.telemetry import cost_tracker_callback, set_llm_cost_stage
+                    set_llm_cost_stage("answer_generation")
+                    llm_chain = get_llm_only_chain()
+                    answer = llm_chain.invoke(
+                        {"question": sanitized_input},
+                        config={"callbacks": [cost_tracker_callback]},
+                    )
+                    result = {
+                        "answer": answer,
+                        "answer_type": "llm_fallback",
+                        "sources": []
+                    }
+                elif intent == "general_knowledge":
+                    # General knowledge - use LLM-only WITHOUT RAG initialization
+                    logger.info("[API] General knowledge query - using LLM-only mode (no RAG initialization)")
+                    # Sanitize input to prevent Azure jailbreak detection
+                    sanitized_input = sanitize_llm_input(normalized_input)
+                    if sanitized_input != normalized_input:
+                        logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
+                    from rag.langchain_orchestrator import get_llm_only_chain
+                    from rag.telemetry import cost_tracker_callback, set_llm_cost_stage
+                    set_llm_cost_stage("answer_generation")
+                    llm_chain = get_llm_only_chain()
+                    answer = llm_chain.invoke(
+                        {"question": sanitized_input},
+                        config={"callbacks": [cost_tracker_callback]},
+                    )
+                    result = {
+                        "answer": answer,
+                        "answer_type": "llm_fallback",
+                        "sources": []
+                    }
+                elif is_report_request(normalized_input):
+                    # Long-format report generation (two-phase: RAG facts + LLM narrative)
+                    logger.info("[API] Report generation mode detected")
+                    result = generate_report(normalized_input)
+                else:
+                    # Financial document query - use RAG pipeline
+                    logger.info("[API] Financial document query - using RAG pipeline")
+                    result = answer_query_simple(normalized_input)
             
             # Validate result structure
             if not isinstance(result, dict):
@@ -800,7 +1191,8 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         return QueryResponse(
             answer=answer,
             answer_type=str(result.get("answer_type", "sagealpha_rag")),
-            sources=formatted_sources  # Always a list, never None
+            sources=formatted_sources,  # Always a list, never None
+            audit_meta=result.get("_meta")
         )
     except HTTPException:
         raise  # Re-raise HTTP exceptions as-is
@@ -826,10 +1218,11 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         )
 
 
-@app.post("/query", response_model=QueryResponse, tags=["Query"])
+@app.post("/query", response_model=QueryResponse, response_model_exclude_none=True, tags=["Query"])
 async def query_rag(
     req: QueryRequest,
-    _: bool = Depends(verify_api_key)
+    _: bool = Depends(verify_api_key),
+    x_debug: Optional[str] = Header(None, alias="X-Debug"),
 ):
     """
     Query the RAG system.
@@ -843,10 +1236,14 @@ async def query_rag(
     
     At least one field must be provided.
     
+    Headers:
+    - **X-Debug**: Set to "true" to include internal audit metadata (_meta) in the response.
+    
     Returns:
     - **answer**: The generated answer
     - **answer_type**: "sagealpha_rag" (from documents), "sagealpha_ai_search" (from web search), "sagealpha_hybrid_search" (combined)
     - **sources**: List of document sources (empty list [] for LLM-only answers, never null)
+    - **_meta**: (optional) Internal audit metadata when debug mode is active
     
     Example request:
     ```json
@@ -855,7 +1252,7 @@ async def query_rag(
     }
     ```
     """
-    return await _process_query(req)
+    return await _process_query(req, x_debug=x_debug)
 
 
 # ================================
