@@ -17,7 +17,9 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 from config.settings import get_config
-from vectorstore.chroma_client import get_collection
+from vectorstore.chroma_client import list_all_collections
+from rag.company_extractor import extract_company_name
+from rag.company_normalizer import normalize_company_name
 from rag.source_formatter import SourceFormatter
 from rag.metrics import MetricsRecorder
 
@@ -90,7 +92,7 @@ class ReportGenerator:
     def __init__(self):
         """Initialize report generator."""
         config = get_config()
-        
+
         # Azure OpenAI LLM (for report generation)
         self.llm = AzureChatOpenAI(
             azure_endpoint=config.azure_openai.endpoint,
@@ -99,10 +101,9 @@ class ReportGenerator:
             api_version=config.azure_openai.api_version,
             temperature=0.3,  # Slightly creative for narrative
         )
-        
+
         self.output_parser = StrOutputParser()
-        self.collection = get_collection(create_if_missing=False)
-        
+
         # Embedding client — same deployment as ingestion and the orchestrator
         # to ensure vector-space consistency.
         embedding_kwargs = {
@@ -146,36 +147,94 @@ Report:"""
         self.report_prompt = ChatPromptTemplate.from_template(self.report_template)
         self.report_chain = self.report_prompt | self.llm | self.output_parser
     
+    def _has_internal_coverage(self, company_name: str) -> bool:
+        """Return ``True`` if *company_name* maps to an internal collection."""
+        normalized = normalize_company_name(company_name) if company_name else None
+        if not normalized:
+            return False
+        for c in list_all_collections(skip_internal=True):
+            name = getattr(c, "name", str(c))
+            if normalized in name:
+                return True
+        return False
+
     def _retrieve_facts(self, query: str, n_results: int = 10) -> tuple[List[str], List[Dict]]:
         """
-        Retrieve factual documents from Chroma using embedding-based search.
+        Retrieve factual documents using the same policy-based routing as
+        the main query pipeline.
+
+        1. Extract company → check internal coverage.
+        2. ``RAG_FIRST``: search matching collections via embeddings.
+        3. ``WEB_FIRST``: skip RAG entirely (report requires internal docs).
 
         Uses the same Azure OpenAI embedding model as ingestion and the
         orchestrator to ensure vector-space consistency.
-        
+
         Args:
             query: User query
             n_results: Number of documents to retrieve
-        
+
         Returns:
             (documents, metadatas)
         """
         try:
-            query_embedding = self.embeddings.embed_query(query)
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-                include=["documents", "metadatas", "distances"]
-            )
-            
-            documents = results.get("documents", [[]])[0] if results.get("documents") else []
-            metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
-            
+            company = extract_company_name(query)
+        except Exception:
+            company = ""
+
+        has_coverage = self._has_internal_coverage(company) if company else False
+
+        if not has_coverage:
             logger.info(
-                "[REPORT] Embedding-based retrieval returned %d documents",
-                len(documents),
+                "[POLICY_ROUTER] report_mode policy=WEB_FIRST "
+                "coverage=%s company=%s",
+                has_coverage,
+                company,
             )
-            return documents, metadatas
+            # Report mode requires internal documents — return empty so
+            # the caller triggers the insufficient-evidence gate.
+            return [], []
+
+        logger.info(
+            "[POLICY_ROUTER] report_mode policy=RAG_FIRST "
+            "coverage=%s company=%s",
+            has_coverage,
+            company,
+        )
+
+        try:
+            query_embedding = self.embeddings.embed_query(query)
+
+            all_documents: List[str] = []
+            all_metadatas: List[Dict] = []
+
+            for col in list_all_collections(skip_internal=True):
+                col_name = getattr(col, "name", str(col))
+                try:
+                    results = col.query(
+                        query_embeddings=[query_embedding],
+                        n_results=n_results,
+                        include=["documents", "metadatas", "distances"],
+                    )
+                    docs = (results.get("documents", [[]])[0]
+                            if results.get("documents") else [])
+                    metas = (results.get("metadatas", [[]])[0]
+                             if results.get("metadatas") else [])
+                    all_documents.extend(docs)
+                    all_metadatas.extend(metas)
+                except Exception as col_exc:
+                    logger.warning(
+                        "[REPORT] Collection '%s' query failed: %s",
+                        col_name,
+                        col_exc,
+                    )
+
+            logger.info(
+                "[REPORT] Embedding-based retrieval returned %d documents "
+                "across all collections",
+                len(all_documents),
+            )
+            return all_documents[:n_results], all_metadatas[:n_results]
         except Exception as e:
             logger.error("[REPORT] Document retrieval failed: %s", e)
             return [], []

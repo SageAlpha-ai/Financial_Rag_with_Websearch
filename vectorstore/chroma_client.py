@@ -267,63 +267,94 @@ def list_all_collections(skip_internal: bool = True) -> List[Collection]:
 
 from rag.company_normalizer import normalize_company_name
 
-def get_company_collection(company_name: str) -> Collection:
+def get_company_collection(company_name: str) -> Optional[Collection]:
     """
     Gets or creates a collection for a specific company.
-    
+
     Args:
         company_name: Raw company name from query or planner.
-        
+
     Returns:
-        Chroma Collection object (normalized name)
+        Chroma ``Collection`` object, or **None** when the company name
+        cannot be normalised or the collection cannot be reached.
+
+        The storage layer **never** raises for a missing or un-resolvable
+        collection — it reports availability and lets the caller decide
+        routing.
     """
     import logging
     logger = logging.getLogger(__name__)
-    
+
     normalized_name = normalize_company_name(company_name)
-    client = get_chroma_client()
-    
-    logger.info(f"[CHROMA] Dataset: {get_config().chroma_cloud.database}")
-    logger.info(f"[CHROMA] Resolved Collection: {normalized_name}")
-    
-    collection = client.get_or_create_collection(
-        name=normalized_name,
-        metadata={"hnsw:space": "cosine"}
-    )
-    
-    doc_count = collection.count()
-    logger.info(f"[CHROMA] Collection '{normalized_name}' has {doc_count} documents")
-    
-    return collection
+    if not normalized_name:
+        logger.warning(
+            "[CHROMA] collection_missing=%s (normalisation failed)",
+            company_name,
+        )
+        return None
+
+    try:
+        client = get_chroma_client()
+
+        logger.info(f"[CHROMA] Dataset: {get_config().chroma_cloud.database}")
+        logger.info(f"[CHROMA] Resolved Collection: {normalized_name}")
+
+        collection = client.get_or_create_collection(
+            name=normalized_name,
+            metadata={"hnsw:space": "cosine"}
+        )
+
+        doc_count = collection.count()
+        logger.info(f"[CHROMA] Collection '{normalized_name}' has {doc_count} documents")
+        return collection
+
+    except Exception as exc:
+        logger.warning(
+            "[CHROMA] collection_missing=%s error=%s",
+            normalized_name,
+            exc,
+        )
+        return None
 
 
 def get_collection(
     name: Optional[str] = None,
     create_if_missing: bool = True
-) -> Collection:
+) -> Optional[Collection]:
     """
     DEPRECATED: Use get_company_collection for per-company isolation.
     Gets or creates a generic collection.
+
+    Returns ``None`` when the collection cannot be accessed (non-fatal).
     """
     import os
     import logging
-    
+
     logger = logging.getLogger(__name__)
-    client = get_chroma_client()
+
+    try:
+        client = get_chroma_client()
+    except Exception as exc:
+        logger.warning("[CHROMA] collection_missing=<default> client_error=%s", exc)
+        return None
+
     config = get_config().chroma_cloud
-    
+
     collection_name = name or config.collection_name
-    
+    if not collection_name:
+        logger.warning("[CHROMA] collection_missing=<empty> — no collection name configured")
+        return None
+
     # Check if auto-creation is enabled via environment variable
     auto_create_env = os.getenv("CHROMA_AUTO_CREATE_COLLECTION", "").lower()
-    
+
     if auto_create_env == "true":
         create_if_missing = True
     elif auto_create_env == "false":
         create_if_missing = False
-    
+
     logger.info(f"[CHROMA] Getting collection: {collection_name} (Dataset: {config.database})")
-    
+
     try:
         if create_if_missing:
             collection = client.get_or_create_collection(
@@ -332,14 +363,16 @@ def get_collection(
             )
         else:
             collection = client.get_collection(name=collection_name)
-        
+
         doc_count = collection.count()
         logger.info(f"[CHROMA] Collection '{collection_name}' ready with {doc_count} documents")
         return collection
-        
+
     except Exception as e:
-        logger.error(f"[CHROMA] Failed to get collection '{collection_name}': {e}")
-        raise ValueError(f"Failed to access Chroma collection '{collection_name}': {str(e)}") from e
+        logger.warning(
+            "[CHROMA] collection_missing=%s error=%s", collection_name, e
+        )
+        return None
 
 
 def get_chat_history_collection() -> Collection:

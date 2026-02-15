@@ -182,6 +182,11 @@ def embed_and_store_documents(
     if fresh:
         from rag.company_normalizer import normalize_company_name
         norm_name = normalize_company_name(company_name)
+        if not norm_name:
+            raise ValueError(
+                f"Cannot run fresh ingestion — company name {company_name!r} "
+                f"could not be normalized to a valid collection slug."
+            )
         print(f"\n[FRESH MODE] Deleting collection '{norm_name}'...")
         try:
             delete_collection(name=norm_name)

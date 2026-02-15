@@ -10,28 +10,16 @@ import re
 from typing import Dict, List, Optional, Tuple
 from datetime import datetime
 
+from rag.query_constraints import extract_fiscal_year
+
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Query constraint extractors (lightweight, no LLM calls)
+# Lightweight keyword-based entity extractor for the consistency filter.
+# This is intentionally NOT the LLM-backed extract_company_name — the
+# consistency filter must run without LLM calls.
 # ---------------------------------------------------------------------------
-
-
-def _extract_fiscal_year(query: str) -> Optional[str]:
-    """Extract fiscal year from *query*. Returns ``FYxxxx`` or ``None``."""
-    patterns = [
-        r'FY\s*(\d{4})',
-        r'fiscal\s+year\s+(\d{4})',
-        r'\b(20\d{2})\b',
-        r'\b(19\d{2})\b',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            return f"FY{match.group(1)}"
-    return None
-
 
 def _extract_entity_from_query(query: str) -> Optional[str]:
     """Extract company/entity from *query* using keyword matching."""
@@ -92,21 +80,20 @@ class EvidenceFusion:
         logger.info(f"[FUSION] Fusing evidence: {len(rag_documents)} RAG docs, {len(web_documents)} web docs")
         
         # ---------------------------------------------------------------- #
-        # Consistency filter                                                #
-        # Drop documents whose metadata contradicts the query's fiscal-year #
-        # or entity constraints.  This does NOT decide answerability — the  #
-        # Tier-1 guardrail (_is_answerable) remains authoritative.  This    #
-        # only prevents inconsistent evidence from reaching the LLM.        #
+        # Consistency filter (soft penalty, no hard drops)                  #
+        # Documents whose metadata contradicts the query's fiscal-year or   #
+        # entity constraints are DEMOTED (priority penalty) but never       #
+        # discarded.  Hard drops caused loss of valuable numeric context    #
+        # for queries where the only available evidence was from a nearby   #
+        # fiscal year.  The Tier-1 guardrail (_is_answerable) remains the   #
+        # authoritative answerability gate.                                 #
         # ---------------------------------------------------------------- #
-        requested_year = _extract_fiscal_year(query)
+        requested_year = extract_fiscal_year(query)
         requested_entity = _extract_entity_from_query(query)
 
+        # Tag documents with penalty flags — consumed in prioritization.
         if requested_year or requested_entity:
-            # --- Filter RAG documents ---
-            filtered_rag_docs: List[str] = []
-            filtered_rag_metas: List[Dict] = []
-            for doc, meta in zip(rag_documents, rag_metadatas):
-                dropped = False
+            for meta in rag_metadatas:
                 doc_year = meta.get("fiscal_year", "")
                 doc_company = meta.get("company", "")
 
@@ -115,33 +102,26 @@ class EvidenceFusion:
                     and doc_year
                     and requested_year.lower() != doc_year.lower()
                 ):
+                    meta["_year_penalty"] = True
                     logger.info(
-                        "[FUSION] Dropped rag document: year mismatch "
+                        "[FUSION] Year mismatch penalty applied "
                         "(requested=%s, doc_year=%s, company=%s)",
                         requested_year, doc_year, doc_company,
                     )
-                    dropped = True
 
-                if not dropped and requested_entity and doc_company:
+                if requested_entity and doc_company:
                     if (
                         requested_entity.lower() not in doc_company.lower()
                         and doc_company.lower() not in requested_entity.lower()
                     ):
+                        meta["_entity_penalty"] = True
                         logger.info(
-                            "[FUSION] Dropped rag document: entity mismatch "
+                            "[FUSION] Entity mismatch penalty applied "
                             "(requested=%s, doc_company=%s)",
                             requested_entity, doc_company,
                         )
-                        dropped = True
 
-                if not dropped:
-                    filtered_rag_docs.append(doc)
-                    filtered_rag_metas.append(meta)
-
-            # --- Filter web documents ---
-            filtered_web_docs: List[Dict] = []
             for web_doc in web_documents:
-                dropped = False
                 doc_meta = web_doc.get("metadata", {})
                 doc_year = doc_meta.get("fiscal_year", "")
                 doc_company = doc_meta.get("company", "")
@@ -151,56 +131,55 @@ class EvidenceFusion:
                     and doc_year
                     and requested_year.lower() != doc_year.lower()
                 ):
+                    doc_meta["_year_penalty"] = True
                     logger.info(
-                        "[FUSION] Dropped web document: year mismatch "
+                        "[FUSION] Web year mismatch penalty applied "
                         "(requested=%s, doc_year=%s)",
                         requested_year, doc_year,
                     )
-                    dropped = True
 
-                if not dropped and requested_entity and doc_company:
+                if requested_entity and doc_company:
                     if (
                         requested_entity.lower() not in doc_company.lower()
                         and doc_company.lower() not in requested_entity.lower()
                     ):
+                        doc_meta["_entity_penalty"] = True
                         logger.info(
-                            "[FUSION] Dropped web document: entity mismatch "
+                            "[FUSION] Web entity mismatch penalty applied "
                             "(requested=%s, doc_company=%s)",
                             requested_entity, doc_company,
                         )
-                        dropped = True
-
-                if not dropped:
-                    filtered_web_docs.append(web_doc)
-
-            # Rebind to filtered sets for the rest of the method
-            rag_documents = filtered_rag_docs
-            rag_metadatas = filtered_rag_metas
-            web_documents = filtered_web_docs
 
             logger.info(
                 "[FUSION] After consistency filter: %d RAG docs, %d web docs",
                 len(rag_documents), len(web_documents),
             )
 
-        # Prioritize web documents (official sources)
+        # Prioritize documents by: penalty (False first) → trust_score
+        # (descending) → cross_score (descending).
         prioritized_docs = []
         sources = []
         conflicts = []
-        
-        # Add web documents first (highest priority)
+
+        # Add web documents.
         for web_doc in web_documents:
             doc_text = web_doc.get("text", "")
             doc_meta = web_doc.get("metadata", {})
-            
+
             if doc_text:
+                has_penalty = bool(
+                    doc_meta.get("_year_penalty")
+                    or doc_meta.get("_entity_penalty")
+                )
                 prioritized_docs.append({
                     "text": doc_text,
                     "metadata": doc_meta,
                     "source_type": "web_official",
-                    "priority": 1
+                    "has_penalty": has_penalty,
+                    "trust_score": float(doc_meta.get("trust_score", 0.5)),
+                    "cross_score": float(doc_meta.get("cross_score", 0.0)),
                 })
-                
+
                 # Add source citation
                 source_url = doc_meta.get("url", "")
                 source_title = doc_meta.get("title", "Official Document")
@@ -208,16 +187,21 @@ class EvidenceFusion:
                     sources.append(f"{source_title} - {source_url}")
                 else:
                     sources.append(source_title)
-        
-        # Add RAG documents (lower priority but still valuable)
+
+        # Add RAG documents.
         for doc, meta in zip(rag_documents, rag_metadatas):
+            has_penalty = bool(
+                meta.get("_year_penalty") or meta.get("_entity_penalty")
+            )
             prioritized_docs.append({
                 "text": doc,
                 "metadata": meta,
                 "source_type": "rag_internal",
-                "priority": 2
+                "has_penalty": has_penalty,
+                "trust_score": float(meta.get("trust_score", 0.75)),
+                "cross_score": float(meta.get("cross_score", 0.0)),
             })
-            
+
             # Add source citation
             source_info = meta.get("source", meta.get("filename", "Internal Document"))
             if meta.get("page"):
@@ -225,10 +209,21 @@ class EvidenceFusion:
             if meta.get("fiscal_year"):
                 source_info += f" (FY: {meta.get('fiscal_year')})"
             sources.append(source_info)
-        
+
+        # Sort by: penalty flag (False < True), then trust_score desc,
+        # then cross_score desc.
+        prioritized_docs.sort(
+            key=lambda d: (
+                d["has_penalty"],          # False (0) before True (1)
+                -d["trust_score"],         # higher trust first
+                -d["cross_score"],         # higher relevance first
+            )
+        )
+        logger.info("[FUSION] sorted_by_trust_then_relevance")
+
         # Check for conflicts (same metric, different values)
         conflicts = EvidenceFusion._detect_conflicts(prioritized_docs, query)
-        
+
         # Build fused context
         context_parts = []
         for doc_info in prioritized_docs:

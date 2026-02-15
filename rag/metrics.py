@@ -11,31 +11,21 @@ document text, or embeddings.
 """
 
 import logging
-import re
 from typing import Optional
+
+from rag.query_constraints import (
+    detect_numeric_intent as _detect_numeric_intent,
+    extract_fiscal_year as _extract_year,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Query constraint extractors (duplicated from orchestrator to avoid
-# circular imports — these are trivial, deterministic helpers).
+# Lightweight keyword-based entity extractor for metrics tagging.
+# Intentionally NOT the LLM-backed extract_company_name — metrics must
+# never invoke LLM calls or add latency.
 # ---------------------------------------------------------------------------
-
-_FINANCIAL_KEYWORDS = [
-    "revenue", "profit", "income", "earnings", "pat",
-    "ebitda", "assets", "equity", "turnover", "sales",
-    "quarterly", "quarter", "q1", "q2", "q3", "q4",
-    "balance sheet", "income statement", "cash flow",
-    "financial statement", "annual report",
-]
-
-_YEAR_PATTERNS = [
-    r'FY\s*(\d{4})',
-    r'fiscal\s+year\s+(\d{4})',
-    r'\b(20\d{2})\b',
-    r'\b(19\d{2})\b',
-]
 
 _ENTITY_MAPPINGS = {
     "oracle financial services": "Oracle Financial Services Software Ltd",
@@ -49,21 +39,6 @@ _ENTITY_MAPPINGS = {
     "tesla": "Tesla",
     "nvidia": "NVIDIA",
 }
-
-
-def _detect_numeric_intent(query: str) -> bool:
-    """Return True if the query has numeric or financial intent."""
-    query_lower = query.lower()
-    return any(kw in query_lower for kw in _FINANCIAL_KEYWORDS)
-
-
-def _extract_year(query: str) -> Optional[str]:
-    """Extract fiscal year from query (FYxxxx or None)."""
-    for pattern in _YEAR_PATTERNS:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            return f"FY{match.group(1)}"
-    return None
 
 
 def _extract_entity(query: str) -> Optional[str]:

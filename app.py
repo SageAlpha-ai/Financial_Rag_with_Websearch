@@ -1001,93 +1001,20 @@ async def _process_query(
         logger.info(f"[API] Processing query: {normalized_input[:100]}...")
         
         # ------------------------------------------------------------ #
-        # Feature flag: planner-driven routing                        #
+        # Policy-based routing (deterministic — no LLM planner)         #
         # ------------------------------------------------------------ #
-        planner_enabled = os.getenv("ENABLE_QUERY_PLANNER", "false").lower() == "true"
+        # Missing collections, absent companies, and empty vectorstores
+        # NEVER produce 500 errors — the policy router falls back
+        # gracefully to WEB_FIRST or LLM-only.
 
         try:
-            if planner_enabled:
-                # Planner enabled — skip intent classification entirely.
-                # The planner decides tool selection for ALL query types.
-                logger.info("[API] Query planner ENABLED — bypassing intent classification")
-
-                if is_report_request(normalized_input):
-                    # Report requests are structural (multi-section), not a routing
-                    # concern — keep them on their dedicated path regardless.
-                    logger.info("[API] Report generation mode detected (planner active)")
-                    result = generate_report(normalized_input)
-                else:
-                    result = answer_query_simple(normalized_input)
-
+            if is_report_request(normalized_input):
+                # Report requests are structural (multi-section), not a routing
+                # concern — keep them on their dedicated path.
+                logger.info("[API] Report generation mode detected")
+                result = generate_report(normalized_input)
             else:
-                # ---------------------------------------------------------
-                # DEPRECATED — Legacy intent-based routing.
-                # This branch uses QueryClassifier (regex keyword matching)
-                # to assign one of three intents and then routes greetings
-                # and general-knowledge queries to an LLM-only chain,
-                # bypassing RAG entirely.  The planner replaces this by
-                # semantically analysing the query and producing an explicit
-                # execution plan that may include RAG, WEB_SEARCH, or
-                # LLM-only — without hard-coded intent categories.
-                # Retained for: rollback safety when ENABLE_QUERY_PLANNER
-                # is false, or when the planner path raises an exception.
-                # ---------------------------------------------------------
-                # STEP 1: Classify query intent BEFORE routing
-                from rag.query_classifier import QueryClassifier
-                query_classification = QueryClassifier.classify_query(normalized_input)
-                intent = query_classification.get("intent", "financial_document_query")
-
-                logger.info(f"[API] Query intent: {intent}")
-
-                # STEP 2: Route based on intent
-                if intent == "greeting":
-                    # Greetings - use LLM-only WITHOUT RAG initialization
-                    logger.info("[API] Greeting detected - using LLM-only mode (no RAG initialization)")
-                    # Sanitize input to prevent Azure jailbreak detection
-                    sanitized_input = sanitize_llm_input(normalized_input)
-                    if sanitized_input != normalized_input:
-                        logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                    from rag.langchain_orchestrator import get_llm_only_chain
-                    from rag.telemetry import cost_tracker_callback, set_llm_cost_stage
-                    set_llm_cost_stage("answer_generation")
-                    llm_chain = get_llm_only_chain()
-                    answer = llm_chain.invoke(
-                        {"question": sanitized_input},
-                        config={"callbacks": [cost_tracker_callback]},
-                    )
-                    result = {
-                        "answer": answer,
-                        "answer_type": "llm_fallback",
-                        "sources": []
-                    }
-                elif intent == "general_knowledge":
-                    # General knowledge - use LLM-only WITHOUT RAG initialization
-                    logger.info("[API] General knowledge query - using LLM-only mode (no RAG initialization)")
-                    # Sanitize input to prevent Azure jailbreak detection
-                    sanitized_input = sanitize_llm_input(normalized_input)
-                    if sanitized_input != normalized_input:
-                        logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                    from rag.langchain_orchestrator import get_llm_only_chain
-                    from rag.telemetry import cost_tracker_callback, set_llm_cost_stage
-                    set_llm_cost_stage("answer_generation")
-                    llm_chain = get_llm_only_chain()
-                    answer = llm_chain.invoke(
-                        {"question": sanitized_input},
-                        config={"callbacks": [cost_tracker_callback]},
-                    )
-                    result = {
-                        "answer": answer,
-                        "answer_type": "llm_fallback",
-                        "sources": []
-                    }
-                elif is_report_request(normalized_input):
-                    # Long-format report generation (two-phase: RAG facts + LLM narrative)
-                    logger.info("[API] Report generation mode detected")
-                    result = generate_report(normalized_input)
-                else:
-                    # Financial document query - use RAG pipeline
-                    logger.info("[API] Financial document query - using RAG pipeline")
-                    result = answer_query_simple(normalized_input)
+                result = answer_query_simple(normalized_input)
             
             # Validate result structure
             if not isinstance(result, dict):
@@ -1197,24 +1124,25 @@ async def _process_query(
     except HTTPException:
         raise  # Re-raise HTTP exceptions as-is
     except Exception as e:
-        # Log error server-side with full traceback
-        logger.error(f"[API] Query processing failed: {str(e)}", exc_info=True)
-        logger.error(f"[API] Exception type: {type(e).__name__}")
-        
-        # Provide more specific error messages for common issues
-        error_msg = str(e).lower()
-        if "chroma" in error_msg or "collection" in error_msg:
-            detail = "Database connection error. Please try again later."
-        elif "openai" in error_msg or "azure" in error_msg:
-            detail = "AI service error. Please try again later."
-        elif "timeout" in error_msg:
-            detail = "Request timeout. Please try again with a simpler query."
-        else:
-            detail = "An error occurred while processing your query. Please try again."
-        
-        raise HTTPException(
-            status_code=500,
-            detail=detail
+        # ------------------------------------------------------------ #
+        # SYSTEM CONTRACT: unexpected failures produce a graceful       #
+        # LLM-only fallback — never a raw 500.                         #
+        # ------------------------------------------------------------ #
+        logger.exception(
+            "[API] Unexpected system failure (%s: %s) — returning "
+            "graceful fallback",
+            type(e).__name__,
+            e,
+        )
+        return QueryResponse(
+            answer=(
+                "I apologize, but I encountered an unexpected error "
+                "while processing your query. Please try again."
+            ),
+            answer_type="LLM_FALLBACK",
+            sources=[],
+            confidence_level="LOW",
+            disclosure_note="Generated without verified internal sources.",
         )
 
 

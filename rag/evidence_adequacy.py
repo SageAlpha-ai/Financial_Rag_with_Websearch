@@ -1,13 +1,30 @@
 """
-Evidence Adequacy Evaluator.
+Evidence Adequacy Evaluator — **DEPRECATED**.
 
-Computes a composite score that decides whether retrieved RAG documents
-are sufficient to answer a query, or whether the system should escalate
+.. deprecated:: 2026-02
+    Replaced by ``rag.answerability_model.AnswerabilityModel``, a
+    feature-based learned routing classifier that uses linear weights +
+    softmax instead of hardcoded thresholds.
+
+    This module is retained for backward compatibility and telemetry
+    reference only.  **No active code path calls
+    ``EvidenceAdequacyEvaluator.evaluate()`` any more.**
+
+    New code should use::
+
+        from rag.answerability_model import AnswerabilityFeatures, AnswerabilityModel
+        result = AnswerabilityModel.predict(features)
+
+Legacy description
+------------------
+Computed a composite score that decided whether retrieved RAG documents
+were sufficient to answer a query, or whether the system should escalate
 to web search or fall back to LLM-only.
 
 Scoring components (weights from config):
     - **llm_score**       — LLM-judged relevance of the top documents.
-    - **retrieval_score** — cosine-distance quality of the best match.
+    - **retrieval_score** — cross-encoder relevance quality of the best
+      match (higher is better, normalised to [0, 1]).
     - **doc_type_score**  — metadata heuristic for document-type fit.
 
 Decision thresholds (from config):
@@ -39,13 +56,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ADEQUACY_CONFIG: Dict[str, Any] = {
     "weights": {
-        "llm": 0.5,
-        "retrieval": 0.3,
-        "doc_type": 0.2,
+        "llm": 0.35,
+        "retrieval": 0.45,
+        "doc_type": 0.20,
     },
     "thresholds": {
-        "use_rag": 0.65,
-        "escalate_web": 0.45,
+        "use_rag": 0.60,
+        "escalate_web": 0.40,
     },
     "retrieval_distance_max": 1.5,
     "retrieval_weights": {
@@ -195,7 +212,12 @@ def _resolve_adequacy_config() -> Dict[str, Any]:
 
 
 class EvidenceAdequacyEvaluator:
-    """Stateless evaluator — all state is passed in, nothing stored."""
+    """**DEPRECATED** — replaced by ``rag.answerability_model.AnswerabilityModel``.
+
+    Retained for backward compatibility.  No active orchestrator code path
+    calls ``evaluate()`` any more.  The learned classifier in
+    ``AnswerabilityModel.predict()`` replaces all threshold-based routing.
+    """
 
     @staticmethod
     def evaluate(
@@ -213,12 +235,21 @@ class EvidenceAdequacyEvaluator:
         ``get_config().evidence_adequacy``).  Hardcoded defaults are used
         only if that config is missing or malformed.
 
+        **Semantic direction**: the primary retrieval signal is now
+        ``best_cross_score`` (higher = stronger evidence, normalised
+        [0, 1]).  All comparison logic uses *higher-is-better* semantics.
+        The legacy ``best_distance`` parameter is kept for backward
+        compatibility and telemetry only; it is **never** used as the
+        primary scoring signal when a cross-encoder score is present.
+
         Args:
             question: The user query.
             rag_docs: Retrieved document texts (may be empty).
             rag_metas: Corresponding metadata dicts (parallel to *rag_docs*).
-            best_distance: Cosine distance of the closest match (lower is
-                better; 0 = identical, 2 = orthogonal).
+            best_distance: **Deprecated positional arg.** Callers now pass
+                ``retrieval_metrics["best_cross_score"]`` here.  Retained
+                only for API compatibility; ignored when
+                ``retrieval_metrics["best_cross_score"]`` is available.
             llm: An initialised ``AzureChatOpenAI`` instance used for the
                 LLM-judged adequacy check (invoked with temperature 0).
 
@@ -248,15 +279,49 @@ class EvidenceAdequacyEvaluator:
         # 1. Retrieval score (multi-signal when retrieval_metrics provided)
         # ------------------------------------------------------------------
         rm = retrieval_metrics or {}
-        best_dist = float(rm.get("best_distance", best_distance))
+
+        # --- Primary signal: cross-encoder score (higher is better) ---
+        # The normalised cross-encoder score is the authoritative
+        # retrieval quality signal.  It is always in [0, 1] after
+        # sigmoid normalization in cross_encoder_reranker.py.
+        best_cross_score = float(rm.get("best_cross_score", 0.0))
+
+        # --- Legacy signal: cosine distance (lower is better) ---
+        # Preserved in metrics for telemetry / dashboards only.
+        # NEVER used as the base_similarity when cross-encoder is active.
+        cosine_best_distance = float(rm.get("best_distance", 2.0))
+
         distance_gap = float(rm.get("distance_gap", 0.0))
         distance_variance = float(rm.get("distance_variance", 0.0))
         diversity_ratio = float(rm.get("diversity_ratio", 1.0))
         year_match_ratio = float(rm.get("year_match_ratio", 1.0))
         company_match_ratio = float(rm.get("company_match_ratio", 1.0))
 
-        max_dist_safe = max(1e-6, max_dist)
-        base_similarity = max(0.0, min(1.0, 1.0 - best_dist / max_dist_safe))
+        # --- Determine base_similarity (always higher-is-better [0, 1]) ---
+        _cross_encoder_active = best_cross_score > 0.0
+
+        if _cross_encoder_active:
+            # Cross-encoder: already normalised [0, 1], higher = better
+            base_similarity = max(0.0, min(1.0, best_cross_score))
+            logger.debug(
+                "[ADEQUACY] Using cross-encoder score as base_similarity: %.4f "
+                "(higher is better)",
+                base_similarity,
+            )
+        else:
+            # Legacy fallback: convert cosine distance → similarity
+            max_dist_safe = max(1e-6, max_dist)
+            base_similarity = max(
+                0.0, min(1.0, 1.0 - cosine_best_distance / max_dist_safe)
+            )
+            logger.debug(
+                "[ADEQUACY] No cross-encoder — using cosine distance→similarity "
+                "as base_similarity: %.4f (distance=%.4f)",
+                base_similarity,
+                cosine_best_distance,
+            )
+
+        # --- Auxiliary signals (unchanged — these are already [0, 1]) ---
         gap_score = min(1.0, distance_gap / 0.15) if distance_gap >= 0 else 0.0
         variance_penalty = max(0.0, 1.0 - distance_variance * 5)
         diversity_bonus = max(0.0, min(1.0, diversity_ratio))
@@ -279,7 +344,10 @@ class EvidenceAdequacyEvaluator:
             "retrieval_signal_computed",
             extra={
                 "event_type": "retrieval_signal",
-                "best_distance": best_dist,
+                "cross_encoder_active": _cross_encoder_active,
+                "best_cross_score": best_cross_score,
+                "cosine_best_distance": cosine_best_distance,
+                "base_similarity": base_similarity,
                 "distance_gap": distance_gap,
                 "distance_variance": distance_variance,
                 "diversity_ratio": diversity_ratio,
@@ -288,6 +356,45 @@ class EvidenceAdequacyEvaluator:
                 "retrieval_score": retrieval_score,
             },
         )
+
+        # ------------------------------------------------------------------
+        # 1b. Deterministic retrieval dominance (higher-is-better)
+        # ------------------------------------------------------------------
+        # When retrieval quality is objectively strong AND enough documents
+        # are present, bypass subjective scoring to guarantee USE_RAG.
+        #
+        # Cross-encoder path: best_cross_score >= 0.85 (higher is better)
+        # Legacy distance path: cosine_best_distance < 0.25 (lower is better)
+        _dominance_by_cross = (
+            _cross_encoder_active
+            and best_cross_score >= 0.85
+            and len(rag_docs) >= 3
+        )
+        _dominance_by_dist = (
+            not _cross_encoder_active
+            and cosine_best_distance < 0.25
+            and len(rag_docs) >= 3
+        )
+        if _dominance_by_cross or _dominance_by_dist:
+            logger.debug(
+                "[ADEQUACY] retrieval dominance short-circuit → USE_RAG "
+                "(cross_encoder_active=%s, best_cross_score=%.4f, "
+                "cosine_best_distance=%.4f, doc_count=%d)",
+                _cross_encoder_active,
+                best_cross_score,
+                cosine_best_distance,
+                len(rag_docs),
+            )
+            # Still compute LLM/doc-type for telemetry completeness
+            llm_score = _llm_adequacy_score(question, rag_docs, llm)
+            doc_type_score = _doc_type_score(question, rag_metas)
+            return {
+                "llm_score": round(llm_score, 4),
+                "retrieval_score": round(retrieval_score, 4),
+                "doc_type_score": round(doc_type_score, 4),
+                "final_score": round(retrieval_score, 4),
+                "decision": "USE_RAG",
+            }
 
         # ------------------------------------------------------------------
         # 2. LLM-judged adequacy score
@@ -302,12 +409,46 @@ class EvidenceAdequacyEvaluator:
         logger.debug("[ADEQUACY] doc_type_score=%.4f", doc_type_score)
 
         # ------------------------------------------------------------------
+        # 4a. Strong retrieval short-circuit
+        # ------------------------------------------------------------------
+        # When retrieval quality alone is high enough, bypass composite
+        # scoring entirely.  This prevents a mediocre LLM adequacy score
+        # from dragging strong internal evidence into ESCALATE_WEB.
+        if retrieval_score >= 0.75:
+            logger.debug("[ADEQUACY] strong retrieval short-circuit → USE_RAG")
+            return {
+                "llm_score": round(llm_score, 4),
+                "retrieval_score": round(retrieval_score, 4),
+                "doc_type_score": round(doc_type_score, 4),
+                "final_score": round(retrieval_score, 4),
+                "decision": "USE_RAG",
+            }
+
+        # ------------------------------------------------------------------
         # 4. Composite score
         # ------------------------------------------------------------------
+        # Dynamic weight override for numeric-intent queries: retrieval
+        # signal is boosted so that concrete financial evidence is not
+        # drowned out by a subjective LLM adequacy score.
+        numeric_intent = _has_numeric_intent(question)
+        if numeric_intent:
+            eff_w_llm = 0.25
+            eff_w_ret = 0.55
+            eff_w_doc = 0.20
+            logger.debug(
+                "[ADEQUACY] numeric-intent weight override: "
+                "llm=%.2f retrieval=%.2f doc_type=%.2f",
+                eff_w_llm, eff_w_ret, eff_w_doc,
+            )
+        else:
+            eff_w_llm = float(weights["llm"])
+            eff_w_ret = float(weights["retrieval"])
+            eff_w_doc = float(weights["doc_type"])
+
         final_score = (
-            weights["llm"] * llm_score
-            + weights["retrieval"] * retrieval_score
-            + weights["doc_type"] * doc_type_score
+            eff_w_llm * llm_score
+            + eff_w_ret * retrieval_score
+            + eff_w_doc * doc_type_score
         )
         final_score = round(final_score, 4)
 
@@ -320,6 +461,20 @@ class EvidenceAdequacyEvaluator:
             decision = "ESCALATE_WEB"
         else:
             decision = "LLM_ONLY"
+
+        # ------------------------------------------------------------------
+        # 5b. Retrieval-score floor: LLM adequacy cannot drag a strong
+        #     retrieval below USE_RAG.
+        # ------------------------------------------------------------------
+        if retrieval_score >= 0.7 and decision != "USE_RAG":
+            logger.debug(
+                "[ADEQUACY] retrieval floor override: %s → USE_RAG "
+                "(retrieval_score=%.4f, composite=%.4f)",
+                decision,
+                retrieval_score,
+                final_score,
+            )
+            decision = "USE_RAG"
 
         logger.debug(
             "[ADEQUACY] final_score=%.4f → decision=%s",

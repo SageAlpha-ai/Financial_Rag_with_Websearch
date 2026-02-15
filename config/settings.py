@@ -112,13 +112,13 @@ BLOCKED_DOMAINS: list[str] = [
 
 EVIDENCE_ADEQUACY_CONFIG: dict = {
     "weights": {
-        "llm": 0.5,
-        "retrieval": 0.3,
-        "doc_type": 0.2,
+        "llm": 0.35,
+        "retrieval": 0.45,
+        "doc_type": 0.20,
     },
     "thresholds": {
-        "use_rag": 0.65,
-        "escalate_web": 0.45,
+        "use_rag": 0.60,
+        "escalate_web": 0.40,
     },
     "retrieval_distance_max": 1.5,
     "retrieval_weights": {
@@ -166,6 +166,68 @@ LLM_COST_CONFIG: dict = {
             "input": 0.00000013,
             "output": 0.0,
         },
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Answerability Model — learned routing classifier (replaces heuristic
+# adequacy thresholds).  Per-class weight vectors + bias for the
+# linear + softmax classifier in rag/answerability_model.py.
+#
+# Weight semantics (per class):
+#   Positive weight  → feature INCREASES probability of that class.
+#   Negative weight  → feature DECREASES probability of that class.
+#   bias             → class prior (offset before softmax).
+#
+# doc_count_normalizer: divides raw doc_count to [0, 1].
+# ---------------------------------------------------------------------------
+ANSWERABILITY_MODEL_CONFIG: dict = {
+    "USE_RAG": {
+        "best_cross_score": 4.0,
+        "doc_count": 1.5,
+        "year_match_ratio": 1.0,
+        "entity_match_ratio": 1.0,
+        "numeric_intent": 0.3,
+        "bias": -2.5,
+    },
+    "ESCALATE_WEB": {
+        "best_cross_score": -1.5,
+        "doc_count": -0.5,
+        "year_match_ratio": -0.8,
+        "entity_match_ratio": -0.8,
+        "numeric_intent": 0.8,
+        "bias": 1.0,
+    },
+    "LLM_ONLY": {
+        "best_cross_score": -3.0,
+        "doc_count": -1.5,
+        "year_match_ratio": -0.5,
+        "entity_match_ratio": -0.5,
+        "numeric_intent": -0.5,
+        "bias": 1.5,
+    },
+    "doc_count_normalizer": 10.0,
+    "version": "v1_linear_softmax",
+}
+
+# ---------------------------------------------------------------------------
+# Source Trust Scoring — institutional-grade document reliability weights.
+# Used by rag/source_trust.py.  Each key maps a structured metadata value
+# to a trust weight in [0.0, 1.0].  Higher = more trusted.
+# ---------------------------------------------------------------------------
+SOURCE_TRUST_CONFIG: dict = {
+    "internal": {
+        "annual_report": 0.95,
+        "investor_presentation": 0.90,
+        "regulatory_filing": 0.92,
+        "earnings_release": 0.88,
+        "default": 0.75,
+    },
+    "web": {
+        "official_domain": 0.90,
+        "regulator_domain": 0.92,
+        "financial_news": 0.65,
+        "unknown": 0.50,
     },
 }
 
@@ -227,7 +289,7 @@ def load_config() -> AppConfig:
         api_key=_get_required_env("CHROMA_API_KEY"),
         tenant=_get_required_env("CHROMA_TENANT"),
         database=_get_required_env("CHROMA_DATABASE"),
-        collection_name=_get_optional_env("CHROMA_COLLECTION_NAME", "DYNAMIC_COLLECTION_REQUIRED"),
+        collection_name=_get_optional_env("CHROMA_COLLECTION_NAME", ""),
     )
     
     return AppConfig(

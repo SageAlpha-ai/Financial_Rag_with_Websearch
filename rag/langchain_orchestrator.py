@@ -41,6 +41,21 @@ from rag.numeric_validator import NumericValidator
 from rag.company_extractor import extract_company_name
 from rag.planner import plan_query
 from rag.telemetry import cost_tracker_callback, set_llm_cost_stage
+from rag.query_constraints import (
+    extract_fiscal_year,
+    detect_numeric_intent,
+    detect_temporal_intent,
+    detect_system_introspection,
+)
+from rag.retrieval_bundle import RetrievalBundle
+from rag.execution_state import ExecutionState
+from rag.cross_encoder_reranker import rerank_documents
+from rag.answerability_model import (
+    AnswerabilityFeatures,
+    AnswerabilityModel,
+)
+from rag.numeric_verifier import verify_numeric_consistency
+from rag.source_trust import SourceTrustScorer
 
 logger = logging.getLogger(__name__)
 
@@ -99,33 +114,19 @@ def _load_all_documents_from_chroma(collection) -> Tuple[List[str], List[Dict]]:
         return [], []
 
 
-def _extract_fiscal_year(query: str) -> Optional[str]:
-    """Extracts fiscal year from query. Returns normalized FYxxxx format."""
-    patterns = [
-        r'FY\s*(\d{4})',
-        r'fiscal\s+year\s+(\d{4})',
-        r'\b(20\d{2})\b',
-        r'\b(19\d{2})\b',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
-        if match:
-            year = match.group(1)
-            return f"FY{year}"
-    
-    return None
+# extract_fiscal_year — removed: canonical version in rag.query_constraints
 
 
 # DEPRECATED — replaced by planner-based routing (rag/planner.py).
 # This function only recognised three OFSS name variants, making it
 # impossible to resolve any other company.  The planner removes the
 # need for hard-coded entity extraction at the routing layer.
-# Retained for: legacy answer_query() fallback when ENABLE_QUERY_PLANNER=false.
+# Legacy routing has been removed.  This function is dead code.
 def _extract_entity_from_query(query: str) -> Optional[str]:
     """Extracts company/entity from query.
 
-    .. deprecated:: Replaced by planner-based routing.
+    .. deprecated:: Replaced by planner-based routing.  Dead code —
+       legacy routing pipeline removed.
     """
     query_lower = query.lower()
     
@@ -194,8 +195,8 @@ def _is_answerable(
             kw in question.lower() for kw in _FINANCIAL_KEYWORDS
         )
         if (
-            _detect_numeric_intent(question)
-            or _extract_fiscal_year(question)
+            detect_numeric_intent(question)
+            or extract_fiscal_year(question)
             or _extract_metrics_from_query(question)
             or has_financial_kw
         ):
@@ -211,7 +212,7 @@ def _is_answerable(
 
     # --- Extract query constraints ---
     requested_entity = extract_company_name(question)
-    requested_year = _extract_fiscal_year(question)
+    requested_year = extract_fiscal_year(question)
     requested_metrics = _extract_metrics_from_query(question)
 
     # No specific constraints detected → pass
@@ -239,20 +240,21 @@ def _is_answerable(
                 ):
                     entity_found = True
                     break
-        # Block only when documents carry company metadata but none match.
-        # Web-search results often lack a ``company`` field; in that case
-        # the entity constraint is not enforceable and we allow the answer.
+        # Entity mismatch is NOT a block condition.  When documents carry
+        # company metadata but none match, we log a warning and continue
+        # with reduced confidence — the caller checks for the
+        # "entity_mismatch_warning" prefix in gate_reason.
         if has_company_metadata and not entity_found:
             logger.warning(
-                "[GUARDRAIL] Entity constraint failed: requested='%s', "
-                "available companies=%s",
+                "[GUARDRAIL] Entity mismatch (non-blocking): requested='%s', "
+                "available companies=%s — continuing with reduced confidence",
                 requested_entity,
                 [m.get("company", "") for m in all_metas if m.get("company")],
             )
             return (
-                False,
-                f"Entity mismatch: no documents match requested company "
-                f"'{requested_entity}'",
+                True,
+                f"entity_mismatch_warning: no documents match requested "
+                f"company '{requested_entity}'",
             )
 
     # --- Fiscal year constraint ---
@@ -319,7 +321,7 @@ def _is_answerable(
 # queries used synonyms not in the keyword list.
 # The planner delegates answerability to the final LLM step, which reasons
 # over the full context rather than string-matching metadata fields.
-# Retained for: legacy answer_query() fallback when ENABLE_QUERY_PLANNER=false.
+# Legacy routing has been removed.  This function is dead code.
 def _validate_answerability(
     query: str,
     documents: List[str],
@@ -343,7 +345,7 @@ def _validate_answerability(
     if not documents:
         return False, "No documents retrieved", {}
     
-    requested_year = _extract_fiscal_year(query)
+    requested_year = extract_fiscal_year(query)
     requested_entity = extract_company_name(query)
     requested_metrics = _extract_metrics_from_query(query)
     
@@ -441,77 +443,13 @@ def _validate_answerability(
     return is_answerable, reason, validation_details
 
 
-def _detect_numeric_intent(query: str) -> bool:
-    """Detect if query has numeric/exact intent."""
-    query_lower = query.lower()
-    numeric_patterns = [
-        r'\d+', r'%', r'\$', r'\btotal\b', r'\bexact\b', r'\brate\b',
-        r'\bvalue\b', r'\brevenue\b', r'\bamount\b', r'\bnumber\b', r'\bcount\b'
-    ]
-    numeric_score = sum(1 for pattern in numeric_patterns if re.search(pattern, query_lower, re.IGNORECASE))
-    return numeric_score >= 2
+# detect_numeric_intent — removed: canonical version in rag.query_constraints
 
 
-def _detect_temporal_intent(query: str) -> bool:
-    """Detect if query requires real-time or current information.
-
-    Returns ``True`` when the query contains temporal keywords that signal
-    the user wants *present-moment* data (e.g. today's date, current price,
-    latest revenue).  Simple keyword matching — no LLM call.
-    """
-    _TEMPORAL_KEYWORDS = [
-        "today", "current", "now", "latest", "as of",
-        "present", "current time", "current date",
-    ]
-    query_lower = query.lower()
-    return any(kw in query_lower for kw in _TEMPORAL_KEYWORDS)
+# detect_temporal_intent — removed: canonical version in rag.query_constraints
 
 
-def _detect_system_introspection(query: str) -> bool:
-    """Detect if the query asks about the system's own capabilities.
-
-    Returns ``True`` for questions about web/internet access, browsing
-    capability, real-time data access, or training-data scope.  These
-    queries are answered with a deterministic system-authored response
-    so that no planner, RAG, web search, or LLM call is needed.
-    """
-    _INTROSPECTION_PHRASES = [
-        "do you have internet",
-        "do you have web",
-        "can you browse",
-        "can you search the web",
-        "can you search the internet",
-        "can you access the internet",
-        "can you access the web",
-        "can you access websites",
-        "do you have access to the internet",
-        "do you have access to the web",
-        "do you have web search",
-        "do you have real-time",
-        "do you have realtime",
-        "do you have real time",
-        "do you have live data",
-        "can you access real-time",
-        "can you access realtime",
-        "can you access live data",
-        "what data do you have access to",
-        "what sources do you use",
-        "what is your training data",
-        "what are your capabilities",
-        "what can you do",
-        "are you connected to the internet",
-        "are you connected to the web",
-        "do you browse the web",
-        "can you look up websites",
-        "can you fetch web pages",
-        "can you go online",
-        "are you online",
-        "training data",
-        "training cutoff",
-        "knowledge cutoff",
-    ]
-    query_lower = query.lower()
-    return any(phrase in query_lower for phrase in _INTROSPECTION_PHRASES)
+# detect_system_introspection — removed: canonical version in rag.query_constraints
 
 
 _SYSTEM_CAPABILITY_RESPONSE = (
@@ -702,8 +640,8 @@ def _build_audit_meta(
     meta: Dict[str, Any] = {
         "tools_executed": tools_executed,
         "execution_path": execution_path,
-        "temporal_override": _detect_temporal_intent(question),
-        "introspection_override": _detect_system_introspection(question),
+        "temporal_override": detect_temporal_intent(question),
+        "introspection_override": detect_system_introspection(question),
         "domains_used": domains_used,
     }
 
@@ -824,7 +762,10 @@ class LangChainOrchestrator:
         """Lazy initialization of BM25 index per company."""
         from rag.company_normalizer import normalize_company_name
         norm_name = normalize_company_name(company_name)
-        
+        if not norm_name:
+            logger.warning("[BM25] Cannot build index — company name normalizes to None")
+            return None
+
         if norm_name in self.bm25_indices:
             return self.bm25_indices[norm_name]
             
@@ -898,10 +839,11 @@ Answer:"""
     # --------------------------------------------------------------------- #
     # Tuning knobs for multi-collection retrieval                            #
     # --------------------------------------------------------------------- #
-    _TOP_K_PER_COLLECTION: int = 5
-    _FINAL_TOP_K: int = 5
+    _TOP_K_PER_COLLECTION: int = 10
+    _FINAL_TOP_K: int = 10
+    _RERANK_POOL_SIZE: int = 20
 
-    def _retrieve_documents_hybrid(self, question: str, company_name: str) -> Tuple[List[str], List[Dict], Dict]:
+    def _retrieve_documents_hybrid(self, question: str, company_name: str) -> RetrievalBundle:
         """Multi-collection retrieval: searches ALL collections in the database.
 
         Instead of resolving a single collection from the company name, this
@@ -922,6 +864,7 @@ Answer:"""
         """
         _empty_metrics: Dict = {
             "best_distance": 2.0,
+            "best_cross_score": 0.0,
             "best_similarity": 0.0,
             "rag_status": "EMPTY",
             "max_age_months": 0,
@@ -959,12 +902,12 @@ Answer:"""
 
             if not collections:
                 logger.warning("[RETRIEVER] No searchable collections found in database")
-                return [], [], _empty_metrics
+                return RetrievalBundle([], [], _empty_metrics)
 
             # ---------------------------------------------------------- #
             # 1. Prepare query                                            #
             # ---------------------------------------------------------- #
-            requested_year = _extract_fiscal_year(question)
+            requested_year = extract_fiscal_year(question)
             if requested_year:
                 logger.info(f"[RETRIEVER] Detected fiscal year in query: {requested_year}")
 
@@ -1284,25 +1227,59 @@ Answer:"""
                     deduped.append((doc, meta, dist, cname))
 
             # ---------------------------------------------------------- #
-            # 5. Select final top_k                                       #
+            # 5. Cross-encoder re-ranking                                 #
             # ---------------------------------------------------------- #
-            top_results = deduped[: self._FINAL_TOP_K]
+            # Take a broader pool (top _RERANK_POOL_SIZE) for re-ranking,
+            # then keep _FINAL_TOP_K after cross-encoder scoring.
+            rerank_pool = deduped[: self._RERANK_POOL_SIZE]
 
-            chroma_docs = [r[0] for r in top_results]
-            chroma_metas = [r[1] for r in top_results]
-            chroma_distances = [r[2] for r in top_results]
+            pool_docs = [r[0] for r in rerank_pool]
+            pool_metas = [r[1] for r in rerank_pool]
+            pool_distances = [r[2] for r in rerank_pool]
+
+            # Preserve cosine distance in metadata for telemetry
+            for meta, dist in zip(pool_metas, pool_distances):
+                meta["cosine_distance"] = dist
+
+            if pool_docs:
+                logger.info(
+                    "[RETRIEVER] Pre-rerank pool: %d candidates (cosine distances: %s)",
+                    len(pool_docs),
+                    [round(d, 4) for d in pool_distances],
+                )
+
+            # Cross-encoder re-ranking: produces (doc, meta, cross_score) sorted desc
+            reranked = rerank_documents(question, pool_docs, pool_metas)
+
+            # Select final top-k from re-ranked results
+            top_reranked = reranked[: self._FINAL_TOP_K]
+
+            chroma_docs = [r[0] for r in top_reranked]
+            chroma_metas = [r[1] for r in top_reranked]
+            chroma_distances = [
+                r[1].get("cosine_distance", 2.0) for r in top_reranked
+            ]
+
+            # Extract the collection name from metadata for compatibility
+            top_results = [
+                (doc, meta, meta.get("cosine_distance", 2.0), meta.get("_source_collection", ""))
+                for doc, meta in zip(chroma_docs, chroma_metas)
+            ]
 
             if chroma_distances:
-                logger.info(f"[RETRIEVER] Top distances after global sort: {chroma_distances}")
-                logger.info(f"[RETRIEVER] Best match distance: {chroma_distances[0]:.4f}")
+                logger.info(f"[RETRIEVER] Top cosine distances (for telemetry): {chroma_distances}")
+                logger.info(f"[RETRIEVER] Best cosine distance: {chroma_distances[0]:.4f}")
 
             if chroma_metas:
+                cross_scores = [m.get("cross_score", 0.0) for m in chroma_metas]
+                best_cross = max(cross_scores) if cross_scores else 0.0
                 sample = chroma_metas[0]
                 logger.info(
-                    "[RETRIEVER] Best match → collection=%s company=%s year=%s",
+                    "[RETRIEVER] Best match (post-rerank) → collection=%s company=%s year=%s cross_score=%.6f",
                     sample.get("_source_collection", "N/A"),
                     sample.get("company", "N/A"),
                     sample.get("fiscal_year", "N/A"),
+                    sample.get("cross_score", 0.0),
                 )
 
             if not chroma_docs:
@@ -1317,11 +1294,19 @@ Answer:"""
             # ---------------------------------------------------------- #
             bm25_docs: List[str] = []
             bm25_metas: List[Dict] = []
-            if _detect_numeric_intent(question) and collections_with_hits:
+            if detect_numeric_intent(question) and collections_with_hits:
                 # Run BM25 on the collection that contributed the best hit
                 best_col_name = top_results[0][3] if top_results else None
                 if best_col_name:
                     best_collection = collections_by_name.get(best_col_name) or get_company_collection(best_col_name)
+                    if best_collection is None:
+                        logger.info(
+                            "[POLICY_ROUTER] No internal coverage for '%s' — BM25 skipped",
+                            best_col_name,
+                        )
+                    else:
+                        pass  # fall through to BM25 try block below
+                if best_col_name and best_collection is not None:
                     try:
                         doc_count = best_collection.count()
                         if doc_count == 0:
@@ -1373,11 +1358,19 @@ Answer:"""
             if company_name and company_name.strip():
                 from rag.company_normalizer import normalize_company_name
                 company_norm = normalize_company_name(company_name)
-                company_matches = sum(
-                    1 for m in merged_metas
-                    if normalize_company_name(str(m.get("company") or m.get("_source_collection") or "")) == company_norm
-                )
-                company_match_ratio = company_matches / n_metas
+                if company_norm:
+                    company_matches = sum(
+                        1 for m in merged_metas
+                        if (
+                            (meta_norm := normalize_company_name(
+                                str(m.get("company") or m.get("_source_collection") or "")
+                            ))
+                            and meta_norm == company_norm
+                        )
+                    )
+                    company_match_ratio = company_matches / n_metas
+                else:
+                    company_match_ratio = 1.0
             else:
                 company_match_ratio = 1.0
 
@@ -1389,14 +1382,41 @@ Answer:"""
             best_sim = max(0.0, 1.0 - (best_dist / 2.0))
             avg_sim = max(0.0, 1.0 - (avg_dist / 2.0))
 
+            # Compute best_cross_score from re-ranked metadata
+            _cross_scores = [
+                m.get("cross_score", 0.0) for m in merged_metas
+                if "cross_score" in m
+            ]
+            best_cross_score = max(_cross_scores) if _cross_scores else 0.0
+
             # --- STABILIZATION: Retrieval Quality Threshold (Rule 3) ---
+            # When a cross-encoder is active, a strong cross-encoder score
+            # overrides a high cosine distance (which can happen when the
+            # bi-encoder and cross-encoder disagree on relevance).
             rag_status = "FOUND" if merged_docs else "EMPTY"
-            if best_dist >= 1.5 and rag_status == "FOUND":
-                logger.warning(f"[RETRIEVER] LOW_CONFIDENCE match detected (dist={best_dist:.4f} >= 1.5)")
-                rag_status = "LOW_CONFIDENCE"
+            if rag_status == "FOUND":
+                if best_cross_score > 0.0:
+                    # Cross-encoder active: LOW_CONFIDENCE only if score is weak
+                    if best_cross_score < 0.3:
+                        logger.warning(
+                            "[RETRIEVER] LOW_CONFIDENCE match detected "
+                            "(best_cross_score=%.4f < 0.3)",
+                            best_cross_score,
+                        )
+                        rag_status = "LOW_CONFIDENCE"
+                else:
+                    # Legacy distance-based check
+                    if best_dist >= 1.5:
+                        logger.warning(
+                            "[RETRIEVER] LOW_CONFIDENCE match detected "
+                            "(dist=%.4f >= 1.5)",
+                            best_dist,
+                        )
+                        rag_status = "LOW_CONFIDENCE"
 
             retrieval_metrics: Dict = {
                 "best_distance": best_dist,
+                "best_cross_score": best_cross_score,
                 "best_similarity": best_sim,
                 "avg_similarity": avg_sim,
                 "top_score": best_sim,
@@ -1502,11 +1522,11 @@ Answer:"""
                 first_doc_preview = merged_docs[0][:500]
                 logger.info(f"[RETRIEVER] First document preview: {first_doc_preview}...")
 
-            return merged_docs, merged_metas, retrieval_metrics
+            return RetrievalBundle(merged_docs, merged_metas, retrieval_metrics)
 
         except Exception as e:
             logger.error(f"[RETRIEVER] Multi-collection retrieval failed: {e}", exc_info=True)
-            return [], [], _empty_metrics
+            return RetrievalBundle([], [], _empty_metrics)
     
     def _retrieve_investor_relations_evidence(
         self,
@@ -1646,6 +1666,42 @@ Answer:"""
         )
         return web_documents
 
+    # ------------------------------------------------------------------ #
+    # Internal coverage signal (policy-based routing)                      #
+    # ------------------------------------------------------------------ #
+
+    def _internal_coverage(self, company_name: str) -> bool:
+        """Return ``True`` if the company has a dedicated internal collection.
+
+        Performs a pure collection-name presence check against the vector-
+        store — no keyword heuristics, no LLM calls, no vocabulary lists.
+
+        Parameters
+        ----------
+        company_name : str
+            Raw company name as extracted from the user query.
+
+        Returns
+        -------
+        bool
+            ``True`` when a matching collection exists, ``False`` otherwise
+            (including when *company_name* is empty or un-normalisable).
+        """
+        from rag.company_normalizer import normalize_company_name
+
+        collections = list_all_collections(skip_internal=True)
+
+        normalized = normalize_company_name(company_name) if company_name else None
+        if not normalized:
+            return False
+
+        for c in collections:
+            name = getattr(c, "name", str(c))
+            if normalized in name:
+                return True
+
+        return False
+
     def _retrieve_web_evidence(
         self,
         question: str,
@@ -1753,6 +1809,7 @@ Answer:"""
         formatted_sources: List[Any] = []
         rag_chain_executed = False
         rag_chain_error = None
+        adequacy_forces_llm_only = False
 
         try:
             logger.info("=" * 60)
@@ -1763,26 +1820,31 @@ Answer:"""
             # -------------------------------------------------------------- #
             # STEP 1: ALWAYS attempt RAG retrieval                            #
             # -------------------------------------------------------------- #
-            # Resolve company for dynamic collection (Rule 1, 4, 7)
+            # Resolve company for metadata-alignment boosting.
+            # Company resolution is NEVER fatal — retrieval must always
+            # proceed.  An unresolved company only means metadata-alignment
+            # boosts are skipped.
             try:
                 company_name = extract_company_name(question)
-                if not company_name:
-                    raise ValueError("Company name could not be resolved.")
             except Exception as e:
-                logger.error(f"[ROUTER] Extraction failed: {e}")
-                return {
-                    "answer": "Company name could not be resolved. Please specify a company clearly.",
-                    "answer_type": "ERROR",
-                    "sources": [],
-                    "confidence_level": "LOW",
-                }
+                logger.warning("[ROUTER] Company extraction raised (%s) — ignored", e)
+                company_name = ""
+
+            if not company_name:
+                logger.warning(
+                    "[RETRIEVER] Company resolution failed — proceeding without strict alignment"
+                )
+                company_name = ""
 
             logger.info("[STEP 1] Attempting RAG retrieval for ALL queries")
-            documents, metadatas, retrieval_metrics = self._retrieve_documents_hybrid(question, company_name)
+            _rag_bundle = self._retrieve_documents_hybrid(question, company_name)
+            documents = list(_rag_bundle.documents)
+            metadatas = list(_rag_bundle.metadatas)
+            retrieval_metrics = _rag_bundle.metrics
             logger.info("[STEP 1] RAG retrieved %d documents", len(documents))
 
             # -------------------------------------------------------------- #
-            # STEP 2: Adequacy-based web escalation (no distance gating)     #
+            # STEP 2: Answerability-based routing (learned classifier)        #
             # -------------------------------------------------------------- #
             web_documents: List[Dict] = []
 
@@ -1791,39 +1853,41 @@ Answer:"""
                 web_documents = self._retrieve_web_evidence(question, company_name)
                 logger.info("[STEP 2] WEB_SEARCH retrieved %d documents", len(web_documents))
             else:
-                from rag.evidence_adequacy import EvidenceAdequacyEvaluator
-                adequacy = EvidenceAdequacyEvaluator.evaluate(
-                    question=question,
-                    rag_docs=documents,
-                    rag_metas=metadatas,
-                    best_distance=retrieval_metrics.get("best_distance", 1.5),
-                    llm=self.llm,
-                    retrieval_metrics=retrieval_metrics,
+                _ans_features = AnswerabilityFeatures(
+                    best_cross_score=retrieval_metrics.get("best_cross_score", 0.0),
+                    doc_count=len(documents),
+                    year_match_ratio=retrieval_metrics.get("year_match_ratio", 1.0),
+                    entity_match_ratio=retrieval_metrics.get("company_match_ratio", 1.0),
+                    numeric_intent=detect_numeric_intent(question),
                 )
+                adequacy = AnswerabilityModel.predict(_ans_features)
                 logger.info(
                     "confidence_gating_decision",
                     extra={
                         "event_type": "confidence_gating",
                         "decision": adequacy["decision"],
-                        "final_score": adequacy["final_score"],
-                        "llm_score": adequacy["llm_score"],
-                        "retrieval_score": adequacy["retrieval_score"],
-                        "doc_type_score": adequacy["doc_type_score"],
+                        "probabilities": adequacy["probabilities"],
+                        "model_version": adequacy["model_version"],
                     },
                 )
                 if adequacy["decision"] == "ESCALATE_WEB":
-                    logger.info("[STEP 2] Adequacy ESCALATE_WEB → triggering WEB_SEARCH")
+                    logger.info("[STEP 2] Answerability ESCALATE_WEB → triggering WEB_SEARCH")
                     web_documents = self._retrieve_web_evidence(question, company_name)
                     logger.info("[STEP 2] WEB_SEARCH retrieved %d documents", len(web_documents))
                 elif adequacy["decision"] == "LLM_ONLY":
-                    logger.info("[STEP 2] Adequacy LLM_ONLY → discarding RAG docs")
-                    documents = []
-                    metadatas = []
+                    # RAG evidence is too poor to use for answer generation.
+                    # Flag LLM-only routing; do NOT destroy documents/metadatas
+                    # so downstream stages still see what was retrieved.
+                    adequacy_forces_llm_only = True
+                    logger.info(
+                        "[STEP 2] Answerability LLM_ONLY — flagged; "
+                        "RAG docs preserved (%d docs)", len(documents),
+                    )
 
             # -------------------------------------------------------------- #
             # STEP 3: Determine execution path                                #
             # -------------------------------------------------------------- #
-            has_rag = len(documents) > 0
+            has_rag = len(documents) > 0 and not adequacy_forces_llm_only
             has_web = len(web_documents) > 0
 
             if has_rag and has_web:
@@ -1838,20 +1902,64 @@ Answer:"""
             logger.info("=" * 60)
             logger.info("[ROUTER] execution_path=%s", execution_path)
             logger.info(
-                "[ROUTER] rag_docs=%d  web_docs=%d",
+                "[ROUTER] rag_docs=%d (usable=%s)  web_docs=%d",
                 len(documents),
+                not adequacy_forces_llm_only,
                 len(web_documents),
             )
             logger.info("=" * 60)
 
             # -------------------------------------------------------------- #
+            # PRE-GUARDRAIL WEB ESCALATION (numeric intent)                   #
+            # -------------------------------------------------------------- #
+            # When adequacy forced LLM_ONLY but the query has numeric
+            # intent, escalate to web BEFORE the answerability gate so
+            # it is not blocked for lack of evidence.
+            if adequacy_forces_llm_only and not web_documents:
+                _has_num = detect_numeric_intent(question)
+                _has_fy = bool(extract_fiscal_year(question))
+                if _has_num or _has_fy:
+                    logger.info(
+                        "[ESCALATION] Numeric intent detected — "
+                        "escalating to web before guardrail"
+                    )
+                    web_documents = self._retrieve_web_evidence(
+                        question, company_name
+                    )
+                    if web_documents:
+                        has_web = True
+                        # Recompute execution path with new web evidence.
+                        if has_rag and has_web:
+                            execution_path = "RAG+WEB_SEARCH+LLM"
+                        elif has_web:
+                            execution_path = "WEB_SEARCH+LLM"
+                        logger.info(
+                            "[ESCALATION] Web escalation retrieved %d "
+                            "documents — execution_path=%s",
+                            len(web_documents), execution_path,
+                        )
+                    else:
+                        logger.info(
+                            "[ESCALATION] Web escalation returned 0 "
+                            "documents — proceeding to LLM"
+                        )
+
+            # -------------------------------------------------------------- #
             # ANSWERABILITY GATE                                               #
             # -------------------------------------------------------------- #
+            # When answerability model forced LLM_ONLY, rag docs are
+            # preserved but excluded from the answerability gate (already
+            # deemed too poor by the classifier).
             _gate_rag = documents if has_rag else []
             _gate_metas = metadatas if has_rag else []
             answerable, gate_reason = _is_answerable(
                 question, _gate_rag, _gate_metas, web_documents,
             )
+
+            # Entity mismatch is non-blocking — reduce confidence but
+            # continue to answer generation.
+            _entity_mismatch = gate_reason.startswith("entity_mismatch_warning")
+
             if not answerable:
                 logger.warning(
                     "[GUARDRAIL] Answerability gate BLOCKED answer: %s",
@@ -1871,6 +1979,42 @@ Answer:"""
                     "confidence_level": "LOW",
                     "disclosure_note": gate_reason,
                 }
+
+            # -------------------------------------------------------------- #
+            # STEP 3b: Multi-source numeric verification                      #
+            # -------------------------------------------------------------- #
+            _numeric_single_source = False
+            if detect_numeric_intent(question) and has_rag:
+                _nv_result = verify_numeric_consistency(
+                    question, documents, metadatas,
+                )
+                if _nv_result["status"] == "CONFLICT":
+                    logger.info(
+                        "[NUMERIC_VERIFIER] CONFLICT detected — "
+                        "forcing web escalation"
+                    )
+                    if not has_web:
+                        web_documents = self._retrieve_web_evidence(
+                            question, company_name,
+                        )
+                        if web_documents:
+                            has_web = True
+                            if has_rag and has_web:
+                                execution_path = "RAG+WEB_SEARCH+LLM"
+                            elif has_web:
+                                execution_path = "WEB_SEARCH+LLM"
+                            logger.info(
+                                "[NUMERIC_VERIFIER] Web escalation retrieved "
+                                "%d documents — execution_path=%s",
+                                len(web_documents), execution_path,
+                            )
+                elif _nv_result["status"] == "SINGLE_SOURCE":
+                    _numeric_single_source = True
+                    logger.info(
+                        "[NUMERIC_VERIFIER] SINGLE_SOURCE — "
+                        "confidence will be reduced to LOW"
+                    )
+                # CONSISTENT → normal flow, no action needed
 
             # -------------------------------------------------------------- #
             # STEP 4: Generate answer                                         #
@@ -1941,8 +2085,12 @@ Answer:"""
                         ) from llm_error
             else:
                 # ----- LLM_ONLY path with soft disclaimer ----- #
-                logger.info("[STEP 4] No evidence available — using LLM-only with disclaimer")
-                MetricsRecorder.record_llm_fallback(question, reason="no_evidence")
+                _llm_reason = (
+                    "adequacy_llm_only" if adequacy_forces_llm_only
+                    else "no_evidence"
+                )
+                logger.info("[STEP 4] No usable evidence — using LLM-only with disclaimer")
+                MetricsRecorder.record_llm_fallback(question, reason=_llm_reason)
                 set_llm_cost_stage("answer_generation")
                 answer = self.llm_only_chain.invoke(
                     {"question": question},
@@ -1950,7 +2098,7 @@ Answer:"""
                 )
 
                 # Append disclaimer — stronger for numeric/financial queries
-                if _detect_numeric_intent(question):
+                if detect_numeric_intent(question):
                     _DISCLAIMER = (
                         "\n\n---\n⚠️ **Note:** This answer is based on general "
                         "knowledge and may not reflect audited or finalized "
@@ -1995,9 +2143,10 @@ Answer:"""
             # -------------------------------------------------------------- #
             # STEP 6: Normalize sources                                       #
             # -------------------------------------------------------------- #
-            source_metas = metadatas if has_rag else []
+            # Always pass original metadatas — retrieval evidence is immutable.
+            # _normalize_sources uses execution_path to decide inclusion.
             formatted_sources = _normalize_sources(
-                source_metas, web_documents, execution_path
+                metadatas, web_documents, execution_path
             )
 
             # -------------------------------------------------------------- #
@@ -2008,7 +2157,7 @@ Answer:"""
             logger.info("=" * 60)
             logger.info("[RESPONSE]   execution_path = %s", execution_path)
             logger.info("[RESPONSE]   answer_type    = %s", answer_type)
-            logger.info("[RESPONSE]   rag_docs       = %d", len(documents))
+            logger.info("[RESPONSE]   rag_docs       = %d (usable=%s)", len(documents), not adequacy_forces_llm_only)
             logger.info("[RESPONSE]   web_docs       = %d", len(web_documents))
             logger.info(
                 "[RESPONSE]   sources_count  = %d", len(formatted_sources),
@@ -2018,16 +2167,38 @@ Answer:"""
             # -------------------------------------------------------------- #
             # STEP 8: Post-Processing & Validation                           #
             # -------------------------------------------------------------- #
-            # 1. Confidence Scoring
+            # 1. Confidence Scoring — always receives original metadatas
+            #    (retrieval evidence is immutable after retrieval stage).
             confidence_score = ConfidenceScorer.calculate_score(
                 execution_path=execution_path,
-                rag_metas=source_metas,
+                rag_metas=metadatas,
                 web_docs=web_documents
             )
             confidence_level = ConfidenceScorer.get_confidence_level(confidence_score)
-            
+
+            # Entity mismatch reduces confidence to LOW regardless of score.
+            if _entity_mismatch:
+                confidence_level = "LOW"
+                logger.info(
+                    "[GUARDRAIL] Confidence reduced to LOW due to entity mismatch"
+                )
+
+            # Single-source numeric verification reduces confidence to LOW.
+            if _numeric_single_source and confidence_level != "LOW":
+                confidence_level = "LOW"
+                logger.info(
+                    "[NUMERIC_VERIFIER] Confidence reduced to LOW — "
+                    "numeric value from single source only"
+                )
+
             # Get disclosure note from legacy logic
             _, disclosure_note = _derive_confidence_and_disclosure(execution_path)
+
+            if _entity_mismatch:
+                disclosure_note = (
+                    "Answer may not match the exact requested company. "
+                    "Verify against official filings."
+                )
 
             # 2. Numeric Validation Guardrail
             all_raw_docs = [doc for doc in documents] + [d.get("text", "") for d in web_documents]
@@ -2197,7 +2368,7 @@ def _execute_planner_plan(
     # ------------------------------------------------------------------
     # Temporal intent override: force WEB_SEARCH → LLM, disable RAG
     # ------------------------------------------------------------------
-    temporal_query = _detect_temporal_intent(question)
+    temporal_query = detect_temporal_intent(question)
     if temporal_query:
         steps = [
             {"tool": "WEB_SEARCH", "goal": "retrieve"},
@@ -2217,26 +2388,33 @@ def _execute_planner_plan(
     tools_executed: List[str] = []
     had_retrieval_steps = False
 
-    # Evidence-adequacy override: when the evaluator decides LLM_ONLY,
+    # Answerability override: when the classifier decides LLM_ONLY,
     # subsequent retrieval steps (WEB_SEARCH) are skipped.
     adequacy_forces_llm_only = False
     adequacy_result: Optional[Dict[str, Any]] = None
 
-    # Resolve company for dynamic collection (Rule 1, 4, 7)
+    # Numeric verification: set when a numeric query has only a single
+    # source backing the value — triggers confidence reduction to LOW.
+    _numeric_single_source = False
+
+    # Entity mismatch flag — set by answerability gate when entity
+    # constraint fails.  Reduces confidence but does not block answer.
+    _entity_mismatch = False
+
+    # Resolve company for metadata-alignment boosting.
+    # Company resolution is NEVER fatal — retrieval must always proceed.
+    # An unresolved company only means metadata-alignment boosts are skipped.
     try:
         company_name = extract_company_name(question)
-        if not company_name:
-            raise ValueError("Company name could not be resolved.")
     except Exception as e:
-        logger.error(f"[PLANNER] Extraction failed: {e}")
-        # In planner mode, we might want to return an error response immediately
-        return {
-            "answer": "Company name could not be resolved. Please specify a company clearly.",
-            "answer_type": "ERROR",
-            "sources": [],
-            "confidence_level": "LOW",
-            "_planner_meta": {"error": str(e)}
-        }
+        logger.warning("[PLANNER] Company extraction raised (%s) — ignored", e)
+        company_name = ""
+
+    if not company_name:
+        logger.warning(
+            "[RETRIEVER] Company resolution failed — proceeding without strict alignment"
+        )
+        company_name = ""
 
     for idx, step in enumerate(steps):
         tool = step["tool"]
@@ -2251,9 +2429,10 @@ def _execute_planner_plan(
 
             had_retrieval_steps = True
             logger.debug("[PLANNER] Step %d: executing RAG retrieve", idx)
-            rag_docs, rag_metas, retrieval_metrics = (
-                orchestrator._retrieve_documents_hybrid(question, company_name)
-            )
+            _rag_bundle = orchestrator._retrieve_documents_hybrid(question, company_name)
+            rag_docs = list(_rag_bundle.documents)
+            rag_metas = list(_rag_bundle.metadatas)
+            retrieval_metrics = _rag_bundle.metrics
             tools_executed.append("RAG")
             logger.debug(
                 "[PLANNER] Step %d: RAG retrieved %d documents", idx, len(rag_docs)
@@ -2283,27 +2462,23 @@ def _execute_planner_plan(
                         idx,
                     )
             else:
-                # --- Evidence adequacy evaluation ---
-                from rag.evidence_adequacy import EvidenceAdequacyEvaluator
-
-                adequacy = EvidenceAdequacyEvaluator.evaluate(
-                    question=question,
-                    rag_docs=rag_docs,
-                    rag_metas=rag_metas,
-                    best_distance=retrieval_metrics.get("best_distance", 1.5),
-                    llm=orchestrator.llm,
-                    retrieval_metrics=retrieval_metrics,
+                # --- Answerability model (learned classifier) ---
+                _ans_features = AnswerabilityFeatures(
+                    best_cross_score=retrieval_metrics.get("best_cross_score", 0.0),
+                    doc_count=len(rag_docs),
+                    year_match_ratio=retrieval_metrics.get("year_match_ratio", 1.0),
+                    entity_match_ratio=retrieval_metrics.get("company_match_ratio", 1.0),
+                    numeric_intent=detect_numeric_intent(question),
                 )
+                adequacy = AnswerabilityModel.predict(_ans_features)
                 adequacy_result = adequacy
                 logger.info(
-                    "evidence adequacy evaluated",
+                    "answerability_evaluated",
                     extra={
-                        "event_type": "evidence_adequacy_evaluated",
-                        "adequacy_decision": adequacy["decision"],
-                        "adequacy_score": adequacy["final_score"],
-                        "llm_score": adequacy["llm_score"],
-                        "retrieval_score": adequacy["retrieval_score"],
-                        "doc_type_score": adequacy["doc_type_score"],
+                        "event_type": "answerability_evaluated",
+                        "decision": adequacy["decision"],
+                        "probabilities": adequacy["probabilities"],
+                        "model_version": adequacy["model_version"],
                     },
                 )
                 logger.info(
@@ -2311,10 +2486,7 @@ def _execute_planner_plan(
                     extra={
                         "event_type": "confidence_gating",
                         "decision": adequacy["decision"],
-                        "final_score": adequacy["final_score"],
-                        "llm_score": adequacy["llm_score"],
-                        "retrieval_score": adequacy["retrieval_score"],
-                        "doc_type_score": adequacy["doc_type_score"],
+                        "probabilities": adequacy["probabilities"],
                     },
                 )
 
@@ -2328,7 +2500,7 @@ def _execute_planner_plan(
                             idx,
                         )
                         web_docs = orchestrator._retrieve_web_evidence(question, company_name)
-                        tools_executed.append("WEB_SEARCH(adequacy)")
+                        tools_executed.append("WEB_SEARCH(answerability)")
                         logger.debug(
                             "[PLANNER] Step %d: supplementary WEB_SEARCH "
                             "retrieved %d documents",
@@ -2337,15 +2509,16 @@ def _execute_planner_plan(
                         )
 
                 elif adequacy["decision"] == "LLM_ONLY":
-                    # RAG evidence is too poor to use — discard and
-                    # force LLM-only (skip subsequent WEB_SEARCH too)
-                    rag_docs = []
-                    rag_metas = []
+                    # RAG evidence is too poor to use for answer generation.
+                    # Flag LLM-only routing; do NOT destroy rag_docs/rag_metas
+                    # so downstream stages (source normalization, confidence
+                    # scoring, audit metadata) still see what was retrieved.
                     adequacy_forces_llm_only = True
                     logger.debug(
                         "[PLANNER] Step %d: LLM_ONLY — "
-                        "RAG evidence discarded by adequacy evaluator",
+                        "answerability model flagged; rag_docs preserved (%d docs)",
                         idx,
+                        len(rag_docs),
                     )
 
                 # USE_RAG: no action needed — proceed with retrieved docs
@@ -2355,7 +2528,7 @@ def _execute_planner_plan(
             if adequacy_forces_llm_only:
                 logger.debug(
                     "[PLANNER] Step %d: WEB_SEARCH skipped "
-                    "(adequacy evaluator forced LLM_ONLY)",
+                    "(answerability model forced LLM_ONLY)",
                     idx,
                 )
                 continue
@@ -2376,7 +2549,9 @@ def _execute_planner_plan(
                 logger.debug(
                     "[PLANNER] WEB_SEARCH returned 0 documents — attempting RAG fallback"
                 )
-                rag_docs, rag_metas, _ = orchestrator._retrieve_documents_hybrid(question, company_name)
+                _fallback_bundle = orchestrator._retrieve_documents_hybrid(question, company_name)
+                rag_docs = list(_fallback_bundle.documents)
+                rag_metas = list(_fallback_bundle.metadatas)
                 tools_executed.append("RAG(fallback)")
                 logger.debug(
                     "[PLANNER] RAG fallback retrieved %d documents",
@@ -2391,10 +2566,51 @@ def _execute_planner_plan(
         elif tool == "LLM" and goal == "answer":
             logger.debug("[PLANNER] Step %d: executing LLM answer", idx)
 
+            # ----------------------------------------------------------
+            # PRE-GUARDRAIL WEB ESCALATION for numeric intent
+            # ----------------------------------------------------------
+            # When adequacy forced LLM_ONLY but the query has numeric
+            # intent, escalate to web BEFORE the answerability gate.
+            # This prevents the guardrail from blocking a numeric query
+            # that could be answered with web evidence.
+            if adequacy_forces_llm_only and not web_docs:
+                _has_num = detect_numeric_intent(question)
+                _has_fy = bool(extract_fiscal_year(question))
+                if _has_num or _has_fy:
+                    logger.info(
+                        "[ESCALATION] Numeric intent detected — "
+                        "escalating to web before guardrail"
+                    )
+                    web_docs = orchestrator._retrieve_web_evidence(
+                        question, company_name
+                    )
+                    if web_docs:
+                        tools_executed.append("WEB_SEARCH(numeric_escalation)")
+                        logger.info(
+                            "[ESCALATION] Web escalation retrieved %d "
+                            "documents",
+                            len(web_docs),
+                        )
+                    else:
+                        logger.info(
+                            "[ESCALATION] Web escalation returned 0 "
+                            "documents — proceeding to LLM"
+                        )
+
             # -- Answerability gate --
+            # When adequacy forced LLM_ONLY, rag_docs are preserved but
+            # must not influence the answerability decision (the adequacy
+            # evaluator already decided the evidence is too poor).
+            _gate_rag = rag_docs if not adequacy_forces_llm_only else []
+            _gate_metas = rag_metas if not adequacy_forces_llm_only else []
             answerable, gate_reason = _is_answerable(
-                question, rag_docs, rag_metas, web_docs,
+                question, _gate_rag, _gate_metas, web_docs,
             )
+
+            # Entity mismatch is non-blocking — flag for confidence
+            # reduction but continue to answer generation.
+            _entity_mismatch = gate_reason.startswith("entity_mismatch_warning")
+
             if not answerable:
                 logger.warning(
                     "[GUARDRAIL] Answerability gate BLOCKED answer: %s",
@@ -2423,12 +2639,54 @@ def _execute_planner_plan(
                     },
                 }
 
-            has_evidence = bool(rag_docs) or bool(web_docs)
+            # -- Multi-source numeric verification --
+            _numeric_single_source = False
+            _has_usable_rag = bool(rag_docs) and not adequacy_forces_llm_only
+            if detect_numeric_intent(question) and _has_usable_rag:
+                _nv_result = verify_numeric_consistency(
+                    question, rag_docs, rag_metas,
+                )
+                if _nv_result["status"] == "CONFLICT":
+                    logger.info(
+                        "[NUMERIC_VERIFIER] CONFLICT detected — "
+                        "forcing web escalation"
+                    )
+                    if not web_docs:
+                        web_docs = orchestrator._retrieve_web_evidence(
+                            question, company_name,
+                        )
+                        if web_docs:
+                            tools_executed.append("WEB_SEARCH(numeric_conflict)")
+                            logger.info(
+                                "[NUMERIC_VERIFIER] Web escalation retrieved "
+                                "%d documents",
+                                len(web_docs),
+                            )
+                elif _nv_result["status"] == "SINGLE_SOURCE":
+                    _numeric_single_source = True
+                    logger.info(
+                        "[NUMERIC_VERIFIER] SINGLE_SOURCE — "
+                        "confidence will be reduced to LOW"
+                    )
+                # CONSISTENT → normal flow, no action needed
 
-            if has_evidence:
-                # Fuse evidence from all retrieval steps
+            # Determine whether usable evidence exists for answer generation.
+            # adequacy_forces_llm_only means RAG docs were retrieved but are
+            # too poor for fusion — they are kept for audit/confidence only.
+            usable_evidence = (
+                (bool(rag_docs) and not adequacy_forces_llm_only)
+                or bool(web_docs)
+            )
+
+            if usable_evidence:
+                # Fuse evidence from all retrieval steps.
+                # When adequacy forced LLM_ONLY, rag_docs are excluded
+                # from fusion (they are preserved only for downstream
+                # source normalization, confidence scoring, and audit).
+                fusion_rag = rag_docs if not adequacy_forces_llm_only else []
+                fusion_metas = rag_metas if not adequacy_forces_llm_only else []
                 fusion_result = EvidenceFusion.fuse_evidence(
-                    rag_docs, rag_metas, web_docs, question
+                    fusion_rag, fusion_metas, web_docs, question
                 )
                 fused_context = fusion_result.get("fused_context", "")
 
@@ -2441,7 +2699,7 @@ def _execute_planner_plan(
                 else:
                     # Fallback: assemble context manually from RAG docs
                     context_parts: List[str] = []
-                    for doc, meta in zip(rag_docs, rag_metas):
+                    for doc, meta in zip(fusion_rag, fusion_metas):
                         meta_info = ""
                         if meta.get("source"):
                             meta_info = f"Source: {meta['source']}"
@@ -2463,7 +2721,13 @@ def _execute_planner_plan(
                     "[PLANNER] Step %d: LLM generated answer from evidence", idx
                 )
             else:
-                MetricsRecorder.record_llm_fallback(question, reason="no_evidence_planner")
+                # LLM-only path: no usable evidence (either nothing
+                # retrieved, or adequacy flagged all RAG docs as too poor).
+                _llm_reason = (
+                    "adequacy_llm_only" if adequacy_forces_llm_only
+                    else "no_evidence_planner"
+                )
+                MetricsRecorder.record_llm_fallback(question, reason=_llm_reason)
                 set_llm_cost_stage("answer_generation")
                 answer = orchestrator.llm_only_chain.invoke(
                     {"question": question},
@@ -2493,46 +2757,38 @@ def _execute_planner_plan(
                 goal,
             )
 
-    # --- Determine execution path (tool-driven, deterministic) ---
-    # Strip auto-escalation / fallback suffixes so the check is clean.
-    _tool_names = {t.split("(")[0] for t in tools_executed}
+    # ------------------------------------------------------------------ #
+    # Resolve execution state (deterministic routing contract)             #
+    # ------------------------------------------------------------------ #
+    # Usable RAG count is 0 when adequacy forced LLM_ONLY — raw rag_docs
+    # are preserved for audit/confidence but must not influence routing.
+    _usable_rag_count = len(rag_docs) if not adequacy_forces_llm_only else 0
 
-    if _tool_names == {"LLM"}:
-        execution_path = "LLM_ONLY"
-        answer_type = "sagealpha_rag"
-    elif "WEB_SEARCH" in _tool_names and "RAG" in _tool_names:
-        execution_path = "WEB_SEARCH+RAG"
-        answer_type = "sagealpha_hybrid_search"
-    elif "WEB_SEARCH" in _tool_names:
-        execution_path = "WEB_SEARCH"
-        answer_type = "sagealpha_ai_search"
-    elif "RAG" in _tool_names:
-        execution_path = "RAG"
-        answer_type = "sagealpha_rag"
-    else:
-        execution_path = "UNKNOWN"
-        answer_type = "sagealpha_rag"
-
-    logger.debug(
-        "[PLANNER] execution_path resolved from tools_executed=%s", tools_executed
+    execution_state = ExecutionState(
+        retrieval_count=_usable_rag_count,
+        web_count=len(web_docs),
+        adequacy_decision=(
+            adequacy_result["decision"] if adequacy_result else "N/A"
+        ),
+        numeric_intent=detect_numeric_intent(question),
+        requested_year=extract_fiscal_year(question),
     )
+    execution_state.resolve_mode()
 
+    # Derive legacy-compatible strings from the governance state.
+    execution_path = execution_state.execution_path
+    answer_type = execution_state.answer_type
     has_evidence = bool(rag_docs) or bool(web_docs)
 
-    # --- Override execution_path when adequacy evaluator forced LLM-only ---
-    # RAG was *attempted* (so "RAG" is in tools_executed) but the evidence
-    # was discarded.  The actual answer came from llm_only_chain, so the
-    # execution_path, confidence, and disclaimer logic must reflect that.
-    if adequacy_forces_llm_only and not has_evidence:
-        execution_path = "LLM_ONLY"
-        answer_type = "sagealpha_rag"
-        logger.debug(
-            "[PLANNER] execution_path overridden to LLM_ONLY "
-            "(adequacy evaluator discarded all evidence)"
-        )
+    logger.info("execution_contract", extra=execution_state.to_log_dict())
+    logger.debug(
+        "[PLANNER] execution_state resolved: %s  (legacy execution_path=%s)",
+        execution_state,
+        execution_path,
+    )
 
     # --- Stronger disclaimer for numeric/financial LLM-only answers ---
-    if execution_path == "LLM_ONLY" and _detect_numeric_intent(question):
+    if execution_state.final_mode == "LLM_ONLY" and execution_state.numeric_intent:
         _FINANCIAL_DISCLAIMER = (
             "\n\n---\n⚠️ **Note:** This answer is based on general "
             "knowledge and may not reflect audited or finalized "
@@ -2550,6 +2806,7 @@ def _execute_planner_plan(
     _extra: Dict[str, Any] = {
         "event_type": "planner_execution_summary",
         "execution_path": execution_path,
+        "final_mode": execution_state.final_mode,
         "tools_executed": tools_executed,
         "rag_doc_count": len(rag_docs),
         "web_doc_count": len(web_docs),
@@ -2579,20 +2836,38 @@ def _execute_planner_plan(
     confidence_level, disclosure_note = _derive_confidence_and_disclosure(
         execution_path
     )
+
+    # Entity mismatch reduces confidence to LOW regardless of path.
+    if _entity_mismatch:
+        confidence_level = "LOW"
+        disclosure_note = (
+            "Answer may not match the exact requested company. "
+            "Verify against official filings."
+        )
+        logger.info(
+            "[GUARDRAIL] Confidence reduced to LOW due to entity mismatch"
+        )
+
+    # Single-source numeric verification reduces confidence to LOW.
+    if _numeric_single_source and confidence_level != "LOW":
+        confidence_level = "LOW"
+        logger.info(
+            "[NUMERIC_VERIFIER] Confidence reduced to LOW — "
+            "numeric value from single source only"
+        )
+
     audit_meta = _build_audit_meta(question, execution_path, tools_executed, web_docs)
 
-    # Attach adequacy scores to audit metadata (debug mode only).
-    # audit_meta is None when debug is off, so this block is a no-op
-    # in production.  No document content is included — scores only.
+    # Attach answerability model output to audit metadata (debug mode
+    # only).  audit_meta is None when debug is off, so this block is
+    # a no-op in production.  No document content is included.
     if audit_meta is not None and adequacy_result is not None:
-        _acfg = getattr(get_config(), "evidence_adequacy", None) or {}
-        audit_meta["evidence_adequacy"] = {
-            "llm_score": adequacy_result["llm_score"],
-            "retrieval_score": adequacy_result["retrieval_score"],
-            "doc_type_score": adequacy_result["doc_type_score"],
-            "final_score": adequacy_result["final_score"],
+        audit_meta["answerability"] = {
             "decision": adequacy_result["decision"],
-            "version": _acfg.get("version", "v1_hybrid"),
+            "probabilities": adequacy_result.get("probabilities", {}),
+            "logits": adequacy_result.get("logits", {}),
+            "features": adequacy_result.get("features", {}),
+            "model_version": adequacy_result.get("model_version", "unknown"),
         }
 
     result: Dict[str, Any] = {
@@ -2607,6 +2882,7 @@ def _execute_planner_plan(
             "has_evidence": has_evidence,
             "had_retrieval_steps": had_retrieval_steps,
             "execution_path": execution_path,
+            "final_mode": execution_state.final_mode,
             "tools_executed": tools_executed,
         },
     }
@@ -2618,27 +2894,36 @@ def _execute_planner_plan(
 
 
 def answer_query_simple(question: str) -> Dict[str, Any]:
-    """Simplified interface for the API layer.
+    """Policy-based entry point for the API layer.
 
-    When ``ENABLE_QUERY_PLANNER`` is ``"true"``, routes the query through
-    the LLM-based planner (``plan_query`` → ``_execute_planner_plan``).
-    Falls back to the legacy ``answer_query()`` path if the planner fails
-    or when the feature flag is disabled.
+    Routes queries **deterministically** based on internal collection
+    coverage — no LLM-based planner, no ``plan_query`` invocation.
 
-    Safety / hardening behaviours:
-        * Single re-plan: if the first plan's retrieval steps yield zero
-          evidence, the planner is re-invoked exactly **once** with the
-          hint *"Previous retrieval returned no results"*.  A second
-          re-plan is never attempted regardless of outcome.
-        * Internal ``_planner_meta`` dict is always stripped before the
-          response reaches the caller / API.
-        * Any uncaught exception in the planner path falls through to
-          legacy routing automatically.
+    Execution policies
+    ------------------
+    ``RAG_FIRST``
+        The company has a dedicated internal collection.  Retrieve from
+        the vectorstore, evaluate answerability, escalate to web search
+        only when the answerability model signals ``ESCALATE_WEB``.
+
+    ``WEB_FIRST``
+        No internal collection (or no company detected, or temporal
+        intent).  Retrieve from the web; fall back to RAG if the web
+        search returns nothing (unless the query is temporal).
+
+    Safety / hardening behaviours
+    -----------------------------
+    * **NO_ANSWER safety net** — if the pipeline produces a
+      ``NO_ANSWER`` (e.g. guardrail block), an LLM-only fallback is
+      invoked to guarantee output.
+    * All error handling (``RuntimeError``, generic ``Exception``) is
+      preserved.
+    * ``_execute_planner_plan`` and ``plan_query`` are **not** called.
     """
     # ------------------------------------------------------------------ #
     # Hard override: system-introspection queries                         #
     # ------------------------------------------------------------------ #
-    if _detect_system_introspection(question):
+    if detect_system_introspection(question):
         logger.info("[SYSTEM] Introspection query handled by system override")
         confidence_level, disclosure_note = _derive_confidence_and_disclosure("SYSTEM")
         audit_meta = _build_audit_meta(question, "SYSTEM", [], [])
@@ -2654,69 +2939,695 @@ def answer_query_simple(question: str) -> Dict[str, Any]:
         return result
 
     # ------------------------------------------------------------------ #
-    # Feature flag: planner-driven routing                                #
-    # ------------------------------------------------------------------ #
-    planner_enabled = os.getenv("ENABLE_QUERY_PLANNER", "false").lower() == "true"
-
-    if planner_enabled:
-        try:
-            orchestrator = get_orchestrator()
-            plan = plan_query(question)
-            result = _execute_planner_plan(orchestrator, question, plan)
-
-            # Single re-plan if first plan yielded no evidence
-            planner_meta = result.pop("_planner_meta", {})
-            if (
-                planner_meta.get("had_retrieval_steps")
-                and not planner_meta.get("has_evidence")
-            ):
-                logger.info(
-                    "[PLANNER] First plan returned no evidence — re-planning once"
-                )
-                plan2 = plan_query(
-                    question + " (Previous retrieval returned no results)"
-                )
-                result = _execute_planner_plan(orchestrator, question, plan2)
-                result.pop("_planner_meta", None)
-
-            return result
-        except Exception as exc:
-            logger.exception(
-                "[PLANNER] HARD FAILURE — planner execution aborted (%s: %s)",
-                type(exc).__name__,
-                exc,
-            )
-            logger.info("[PLANNER] Falling back to legacy routing after planner failure")
-    else:
-        logger.info("[PLANNER] Query planner is DISABLED, using legacy routing")
-
-    # ------------------------------------------------------------------ #
-    # Legacy path (original behaviour, unchanged)                         #
+    # Policy-based routing (deterministic — no LLM planner)               #
     # ------------------------------------------------------------------ #
     try:
         orchestrator = get_orchestrator()
-        return orchestrator.answer_query(question)
+
+        # --- Temporal intent ---
+        temporal_query = detect_temporal_intent(question)
+
+        # --- Company extraction (never fatal) ---
+        try:
+            company_name = extract_company_name(question)
+        except Exception as e:
+            logger.warning(
+                "[POLICY_ROUTER] Company extraction raised (%s) — ignored", e
+            )
+            company_name = ""
+        if not company_name:
+            company_name = ""
+
+        # --- Internal coverage signal ---
+        has_internal = orchestrator._internal_coverage(company_name)
+
+        if temporal_query:
+            execution_policy = "WEB_FIRST"
+        elif has_internal:
+            execution_policy = "RAG_FIRST"
+        else:
+            execution_policy = "WEB_FIRST"
+
+        logger.info(
+            "[POLICY_ROUTER] execution_policy=%s company=%s "
+            "coverage=%s temporal=%s",
+            execution_policy,
+            company_name,
+            has_internal,
+            temporal_query,
+        )
+        logger.info("[ROUTING_CONTRACT] resilient=True")
+
+        # --- Accumulated evidence across retrieval steps ---
+        rag_docs: List[str] = []
+        rag_metas: List[Dict] = []
+        web_docs: List[Dict] = []
+        answer = ""
+        tools_executed: List[str] = []
+        adequacy_forces_llm_only = False
+        adequacy_result: Optional[Dict[str, Any]] = None
+        _numeric_single_source = False
+        _entity_mismatch = False
+        retrieval_metrics: Dict[str, Any] = {}
+
+        # ============================================================== #
+        #  RAG_FIRST path                                                 #
+        # ============================================================== #
+        if execution_policy == "RAG_FIRST":
+            _rag_bundle = orchestrator._retrieve_documents_hybrid(
+                question, company_name
+            )
+            rag_docs = list(_rag_bundle.documents)
+            rag_metas = list(_rag_bundle.metadatas)
+            retrieval_metrics = _rag_bundle.metrics
+            tools_executed.append("RAG")
+
+            logger.info(
+                "[POLICY_ROUTER] RAG retrieved %d documents", len(rag_docs)
+            )
+
+            if len(rag_docs) == 0:
+                # RAG empty — escalate to web
+                web_docs = orchestrator._retrieve_web_evidence(
+                    question, company_name
+                )
+                tools_executed.append("WEB_SEARCH(rag_empty)")
+                logger.info(
+                    "[POLICY_ROUTER] RAG empty — web escalation "
+                    "retrieved %d documents",
+                    len(web_docs),
+                )
+            else:
+                # --- Answerability model (learned classifier) ---
+                _ans_features = AnswerabilityFeatures(
+                    best_cross_score=retrieval_metrics.get(
+                        "best_cross_score", 0.0
+                    ),
+                    doc_count=len(rag_docs),
+                    year_match_ratio=retrieval_metrics.get(
+                        "year_match_ratio", 1.0
+                    ),
+                    entity_match_ratio=retrieval_metrics.get(
+                        "company_match_ratio", 1.0
+                    ),
+                    numeric_intent=detect_numeric_intent(question),
+                )
+                adequacy = AnswerabilityModel.predict(_ans_features)
+                adequacy_result = adequacy
+
+                logger.info(
+                    "answerability_evaluated",
+                    extra={
+                        "event_type": "answerability_evaluated",
+                        "decision": adequacy["decision"],
+                        "probabilities": adequacy["probabilities"],
+                        "model_version": adequacy["model_version"],
+                    },
+                )
+                logger.info(
+                    "[POLICY_ROUTER] routing_decision=%s",
+                    adequacy["decision"],
+                )
+
+                if adequacy["decision"] == "ESCALATE_WEB":
+                    web_docs = orchestrator._retrieve_web_evidence(
+                        question, company_name
+                    )
+                    tools_executed.append("WEB_SEARCH(answerability)")
+                    logger.info(
+                        "[POLICY_ROUTER] ESCALATE_WEB — web search "
+                        "retrieved %d documents",
+                        len(web_docs),
+                    )
+                elif adequacy["decision"] == "LLM_ONLY":
+                    adequacy_forces_llm_only = True
+                    logger.info(
+                        "[POLICY_ROUTER] LLM_ONLY — RAG docs preserved "
+                        "(%d docs) but excluded from fusion",
+                        len(rag_docs),
+                    )
+                # USE_RAG: no action needed — proceed with retrieved docs
+
+        # ============================================================== #
+        #  WEB_FIRST path                                                 #
+        # ============================================================== #
+        elif execution_policy == "WEB_FIRST":
+            web_docs = orchestrator._retrieve_web_evidence(
+                question, company_name
+            )
+            tools_executed.append("WEB_SEARCH")
+
+            logger.info(
+                "[POLICY_ROUTER] WEB_SEARCH retrieved %d documents",
+                len(web_docs),
+            )
+
+            # Fallback to RAG if web empty (skip for temporal queries)
+            if not web_docs and not temporal_query:
+                _rag_bundle = orchestrator._retrieve_documents_hybrid(
+                    question, company_name
+                )
+                rag_docs = list(_rag_bundle.documents)
+                rag_metas = list(_rag_bundle.metadatas)
+                retrieval_metrics = _rag_bundle.metrics
+                tools_executed.append("RAG(fallback)")
+                logger.info(
+                    "[POLICY_ROUTER] Web empty — RAG fallback "
+                    "retrieved %d documents",
+                    len(rag_docs),
+                )
+            elif not web_docs and temporal_query:
+                logger.info(
+                    "[POLICY_ROUTER] Temporal query — RAG fallback skipped"
+                )
+
+        # ============================================================== #
+        #  Attach trust scores to all retrieved documents                 #
+        # ============================================================== #
+        for _m in rag_metas:
+            _m["trust_score"] = SourceTrustScorer.score(_m)
+        for _wd in web_docs:
+            _wd_meta = _wd.get("metadata", _wd)
+            _wd_meta["trust_score"] = SourceTrustScorer.score(_wd_meta)
+
+        # ============================================================== #
+        #  Pre-guardrail web escalation for numeric intent                #
+        # ============================================================== #
+        if adequacy_forces_llm_only and not web_docs:
+            _has_num = detect_numeric_intent(question)
+            _has_fy = bool(extract_fiscal_year(question))
+            if _has_num or _has_fy:
+                logger.info(
+                    "[ESCALATION] Numeric intent detected — "
+                    "escalating to web before guardrail"
+                )
+                web_docs = orchestrator._retrieve_web_evidence(
+                    question, company_name
+                )
+                if web_docs:
+                    # Attach trust scores to late-arriving web docs
+                    for _wd in web_docs:
+                        _wd_meta = _wd.get("metadata", _wd)
+                        _wd_meta["trust_score"] = SourceTrustScorer.score(
+                            _wd_meta
+                        )
+                    tools_executed.append("WEB_SEARCH(numeric_escalation)")
+                    logger.info(
+                        "[ESCALATION] Web escalation retrieved %d documents",
+                        len(web_docs),
+                    )
+                else:
+                    logger.info(
+                        "[ESCALATION] Web escalation returned 0 documents "
+                        "— proceeding to LLM"
+                    )
+
+        # ============================================================== #
+        #  Guardrail: answerability gate                                  #
+        # ============================================================== #
+        _gate_rag = rag_docs if not adequacy_forces_llm_only else []
+        _gate_metas = rag_metas if not adequacy_forces_llm_only else []
+        answerable, gate_reason = _is_answerable(
+            question, _gate_rag, _gate_metas, web_docs,
+        )
+
+        _entity_mismatch = gate_reason.startswith("entity_mismatch_warning")
+
+        if not answerable:
+            logger.warning(
+                "[GUARDRAIL] Answerability gate BLOCKED answer: %s",
+                gate_reason,
+            )
+            MetricsRecorder.record_blocked_query(
+                question,
+                gate_reason,
+                has_documents=bool(rag_docs) or bool(web_docs),
+            )
+            tools_executed.append("LLM(blocked)")
+            result = {
+                "answer": (
+                    "No verified documents matching the requested "
+                    "company, time period, and metrics were found. "
+                    "Exact figures cannot be provided."
+                ),
+                "answer_type": "NO_ANSWER",
+                "sources": [],
+                "confidence_level": "LOW",
+                "disclosure_note": gate_reason,
+            }
+            # Fall through to the NO_ANSWER safety net below
+        else:
+            # ========================================================== #
+            #  Multi-source numeric verification                          #
+            # ========================================================== #
+            _numeric_single_source = False
+            _numeric_conflict = False
+            _conflict_groups: List[Dict[str, Any]] = []
+            _nv_result: Optional[Dict[str, Any]] = None
+            _has_usable_rag = bool(rag_docs) and not adequacy_forces_llm_only
+            if detect_numeric_intent(question) and _has_usable_rag:
+                _nv_result = verify_numeric_consistency(
+                    question, rag_docs, rag_metas,
+                )
+                if _nv_result["status"] == "CONFLICT":
+                    _numeric_conflict = True
+                    _conflict_groups = _nv_result.get("groups", [])
+                    _winning = (
+                        _conflict_groups[0] if _conflict_groups else {}
+                    )
+
+                    logger.warning(
+                        "[NUMERIC_CONFLICT] groups=%s selected_value=%s",
+                        _conflict_groups,
+                        _winning.get("value"),
+                    )
+
+                    logger.info(
+                        "[NUMERIC_VERIFIER] CONFLICT detected — "
+                        "forcing web escalation"
+                    )
+                    if not web_docs:
+                        web_docs = orchestrator._retrieve_web_evidence(
+                            question, company_name,
+                        )
+                        if web_docs:
+                            for _wd in web_docs:
+                                _wd_meta = _wd.get("metadata", _wd)
+                                _wd_meta["trust_score"] = (
+                                    SourceTrustScorer.score(_wd_meta)
+                                )
+                            tools_executed.append(
+                                "WEB_SEARCH(numeric_conflict)"
+                            )
+                            logger.info(
+                                "[NUMERIC_VERIFIER] Web escalation "
+                                "retrieved %d documents",
+                                len(web_docs),
+                            )
+                elif _nv_result["status"] == "SINGLE_SOURCE":
+                    _numeric_single_source = True
+                    logger.info(
+                        "[NUMERIC_VERIFIER] SINGLE_SOURCE — "
+                        "confidence will be reduced to LOW"
+                    )
+                # CONSISTENT → normal flow, no action needed
+
+            # ========================================================== #
+            #  Answer generation                                          #
+            # ========================================================== #
+            usable_evidence = (
+                (bool(rag_docs) and not adequacy_forces_llm_only)
+                or bool(web_docs)
+            )
+
+            if usable_evidence:
+                fusion_rag = rag_docs if not adequacy_forces_llm_only else []
+                fusion_metas = rag_metas if not adequacy_forces_llm_only else []
+                fusion_result = EvidenceFusion.fuse_evidence(
+                    fusion_rag, fusion_metas, web_docs, question
+                )
+                fused_context = fusion_result.get("fused_context", "")
+
+                set_llm_cost_stage("answer_generation")
+                if fused_context:
+                    answer = orchestrator.rag_chain.invoke(
+                        {"question": question, "context": fused_context},
+                        config={"callbacks": [cost_tracker_callback]},
+                    )
+                else:
+                    context_parts: List[str] = []
+                    for doc, meta in zip(fusion_rag, fusion_metas):
+                        meta_info = ""
+                        if meta.get("source"):
+                            meta_info = f"Source: {meta['source']}"
+                        if meta.get("fiscal_year"):
+                            meta_info += f", FY: {meta['fiscal_year']}"
+                        if meta.get("page"):
+                            meta_info += f", Page: {meta['page']}"
+                        context_parts.append(
+                            f"[{meta_info}]\n{doc}" if meta_info else doc
+                        )
+                    answer = orchestrator.rag_chain.invoke(
+                        {
+                            "question": question,
+                            "context": "\n\n---\n\n".join(context_parts),
+                        },
+                        config={"callbacks": [cost_tracker_callback]},
+                    )
+                logger.info(
+                    "[POLICY_ROUTER] LLM generated answer from evidence"
+                )
+                tools_executed.append("LLM")
+            else:
+                _llm_reason = (
+                    "adequacy_llm_only"
+                    if adequacy_forces_llm_only
+                    else "no_evidence_policy"
+                )
+                MetricsRecorder.record_llm_fallback(
+                    question, reason=_llm_reason
+                )
+                set_llm_cost_stage("answer_generation")
+                answer = orchestrator.llm_only_chain.invoke(
+                    {"question": question},
+                    config={"callbacks": [cost_tracker_callback]},
+                )
+                if temporal_query:
+                    _TEMPORAL_DISCLAIMER = (
+                        "\n\n---\n⚠️ Real-time data could not be verified "
+                        "via live sources at the time of the request."
+                    )
+                    answer = answer.rstrip() + _TEMPORAL_DISCLAIMER
+                    logger.info(
+                        "[POLICY_ROUTER] LLM answer with temporal disclaimer"
+                    )
+                else:
+                    logger.info(
+                        "[POLICY_ROUTER] LLM generated answer (no evidence)"
+                    )
+                tools_executed.append("LLM")
+
+            # ========================================================== #
+            #  Execution state (deterministic routing contract)           #
+            # ========================================================== #
+            _usable_rag_count = (
+                len(rag_docs) if not adequacy_forces_llm_only else 0
+            )
+            execution_state = ExecutionState(
+                retrieval_count=_usable_rag_count,
+                web_count=len(web_docs),
+                adequacy_decision=(
+                    adequacy_result["decision"]
+                    if adequacy_result
+                    else "N/A"
+                ),
+                numeric_intent=detect_numeric_intent(question),
+                requested_year=extract_fiscal_year(question),
+            )
+            execution_state.resolve_mode()
+
+            execution_path = execution_state.execution_path
+            answer_type = execution_state.answer_type
+            has_evidence = bool(rag_docs) or bool(web_docs)
+
+            logger.info(
+                "execution_contract", extra=execution_state.to_log_dict()
+            )
+            logger.info(
+                "[POLICY_ROUTER] execution_state resolved: %s  "
+                "(legacy execution_path=%s)",
+                execution_state,
+                execution_path,
+            )
+
+            # --- Stronger disclaimer for numeric LLM-only answers ---
+            if (
+                execution_state.final_mode == "LLM_ONLY"
+                and execution_state.numeric_intent
+            ):
+                _FINANCIAL_DISCLAIMER = (
+                    "\n\n---\n⚠️ **Note:** This answer is based on general "
+                    "knowledge and may not reflect audited or finalized "
+                    "financial figures. For authoritative values, please "
+                    "consult the company's official investor relations "
+                    "filings or regulatory disclosures."
+                )
+                answer = answer.rstrip() + _FINANCIAL_DISCLAIMER
+                logger.info(
+                    "[POLICY_ROUTER] Appended financial disclaimer "
+                    "(LLM_ONLY + numeric intent)"
+                )
+
+            # --- Normalize sources ---
+            formatted_sources = _normalize_sources(
+                rag_metas, web_docs, execution_path
+            )
+
+            # --- Calibrated confidence signal ---
+            # Combines cross-encoder relevance, numeric trust weight,
+            # and routing probability into a single [0, 1] signal.
+            _max_cross = float(
+                retrieval_metrics.get("best_cross_score", 0.0)
+            )
+            _nv_trust_raw = float(
+                _nv_result.get("trust_weight_sum", 0.0)
+                if _nv_result is not None
+                else 0.0
+            )
+            _nv_trust_norm = min(1.0, _nv_trust_raw)
+            _routing_prob = 0.0
+            if adequacy_result and adequacy_result.get("probabilities"):
+                _sel_decision = adequacy_result.get("decision", "")
+                _routing_prob = float(
+                    adequacy_result["probabilities"].get(
+                        _sel_decision, 0.0
+                    )
+                )
+            _confidence_signal = (
+                0.4 * _max_cross
+                + 0.3 * _nv_trust_norm
+                + 0.3 * _routing_prob
+            )
+
+            if _confidence_signal >= 0.80:
+                confidence_level = "HIGH"
+            elif _confidence_signal >= 0.60:
+                confidence_level = "MEDIUM"
+            else:
+                confidence_level = "LOW"
+
+            # Derive disclosure from base path (non-overridden).
+            _, disclosure_note = _derive_confidence_and_disclosure(
+                execution_path
+            )
+
+            logger.info(
+                "[CONFIDENCE] signal=%.4f mapped=%s "
+                "(cross=%.3f nv_trust=%.3f routing_prob=%.3f)",
+                _confidence_signal,
+                confidence_level,
+                _max_cross,
+                _nv_trust_norm,
+                _routing_prob,
+            )
+
+            # --- Overrides (must stay after calibration) ---
+            if _numeric_conflict:
+                confidence_level = "LOW"
+                disclosure_note = (
+                    "Multiple conflicting financial figures were "
+                    "detected across sources. The system prioritised "
+                    "the value supported by the highest-trust sources."
+                )
+                logger.info(
+                    "[CONFIDENCE] downgraded_due_to_conflict=True"
+                )
+
+            if _entity_mismatch:
+                confidence_level = "LOW"
+                disclosure_note = (
+                    "Answer may not match the exact requested company. "
+                    "Verify against official filings."
+                )
+                logger.info(
+                    "[GUARDRAIL] Confidence reduced to LOW "
+                    "due to entity mismatch"
+                )
+
+            if _numeric_single_source and confidence_level != "LOW":
+                confidence_level = "LOW"
+                logger.info(
+                    "[NUMERIC_VERIFIER] Confidence reduced to LOW — "
+                    "numeric value from single source only"
+                )
+
+            # --- Audit metadata ---
+            audit_meta = _build_audit_meta(
+                question, execution_path, tools_executed, web_docs
+            )
+            if audit_meta is not None and adequacy_result is not None:
+                audit_meta["answerability"] = {
+                    "decision": adequacy_result["decision"],
+                    "probabilities": adequacy_result.get("probabilities", {}),
+                    "logits": adequacy_result.get("logits", {}),
+                    "features": adequacy_result.get("features", {}),
+                    "model_version": adequacy_result.get(
+                        "model_version", "unknown"
+                    ),
+                }
+
+            # --- Trust analysis (audit extension) ---
+            _all_trust = [
+                m.get("trust_score", 0.0) for m in rag_metas
+            ] + [
+                wd.get("metadata", wd).get("trust_score", 0.0)
+                for wd in web_docs
+            ]
+            if audit_meta is not None:
+                audit_meta["trust_analysis"] = {
+                    "average_trust": round(
+                        sum(_all_trust) / len(_all_trust), 4
+                    ) if _all_trust else 0.0,
+                    "max_trust": round(
+                        max(_all_trust), 4
+                    ) if _all_trust else 0.0,
+                    "numeric_trust_weight": round(_nv_trust_raw, 4),
+                    "confidence_signal": round(_confidence_signal, 4),
+                }
+
+            # --- Numeric conflict audit (transparent resolution) ---
+            if audit_meta is not None and _numeric_conflict:
+                _winning = (
+                    _conflict_groups[0] if _conflict_groups else {}
+                )
+                audit_meta["numeric_conflict"] = {
+                    "groups": _conflict_groups,
+                    "selected_value": _winning.get("value"),
+                    "selected_trust_weight": _winning.get(
+                        "trust_weight_sum"
+                    ),
+                }
+
+            # --- Structured observability summary ---
+            _extra: Dict[str, Any] = {
+                "event_type": "policy_execution_summary",
+                "execution_policy": execution_policy,
+                "execution_path": execution_path,
+                "final_mode": execution_state.final_mode,
+                "tools_executed": tools_executed,
+                "rag_doc_count": len(rag_docs),
+                "web_doc_count": len(web_docs),
+                "answer_type": answer_type,
+                "coverage": has_internal,
+            }
+            _rid = get_request_id()
+            if _rid is not None:
+                _extra["request_id"] = _rid
+            logger.info("policy execution complete", extra=_extra)
+
+            from rag.telemetry import cost_tracker
+
+            telemetry = cost_tracker.summary()
+            logger.info(
+                "llm_cost_summary",
+                extra={
+                    "event_type": "llm_cost_summary",
+                    "total_input_tokens": telemetry["total_input_tokens"],
+                    "total_output_tokens": telemetry["total_output_tokens"],
+                    "total_cost_usd": round(
+                        telemetry["total_cost_usd"], 6
+                    ),
+                    "stages": telemetry["stages"],
+                },
+            )
+
+            # --- Build final result ---
+            result = {
+                "answer": answer,
+                "answer_type": answer_type,
+                "sources": formatted_sources,
+                "confidence_level": confidence_level,
+                "disclosure_note": disclosure_note,
+            }
+            if audit_meta is not None:
+                result["_meta"] = audit_meta
+            if has_evidence:
+                MetricsRecorder.record_rag_answer(
+                    question, has_documents=True
+                )
+
+        # -------------------------------------------------------------- #
+        # FINAL SAFETY NET: System must ALWAYS produce an answer.         #
+        # If the pipeline returned NO_ANSWER (e.g. guardrail block on    #
+        # year/metric mismatch), fall back to a direct LLM call.          #
+        # -------------------------------------------------------------- #
+        if result.get("answer_type") == "NO_ANSWER":
+            logger.warning(
+                "[FALLBACK] Pipeline returned NO_ANSWER — invoking "
+                "LLM fallback to guarantee output"
+            )
+            try:
+                set_llm_cost_stage("answer_generation")
+                fallback_answer = orchestrator.llm_only_chain.invoke(
+                    {"question": question},
+                    config={"callbacks": [cost_tracker_callback]},
+                )
+                result = {
+                    "answer": str(fallback_answer),
+                    "answer_type": "LLM_FALLBACK",
+                    "sources": [],
+                    "confidence_level": "LOW",
+                    "disclosure_note": (
+                        "Generated without verified internal sources."
+                    ),
+                }
+                MetricsRecorder.record_llm_fallback(
+                    question, reason="no_answer_safety_net"
+                )
+                logger.info("[FALLBACK] LLM fallback answer generated")
+            except Exception as fb_exc:
+                logger.error(
+                    "[FALLBACK] LLM fallback also failed: %s", fb_exc
+                )
+                result = {
+                    "answer": (
+                        "I was unable to find verified documents for this "
+                        "query, and the general-knowledge fallback also "
+                        "encountered an error. Please try rephrasing."
+                    ),
+                    "answer_type": "LLM_FALLBACK",
+                    "sources": [],
+                    "confidence_level": "LOW",
+                    "disclosure_note": (
+                        "Generated without verified internal sources."
+                    ),
+                }
+
+        return result
+
     except RuntimeError as e:
-        # Handle initialization errors
         error_msg = str(e)
-        logger.error(f"[API] Orchestrator error: {error_msg}")
-        
-        # Return a user-friendly error response
+        logger.error("[POLICY_ROUTER] RuntimeError: %s", error_msg)
+
         if "ChromaDB collection is EMPTY" in error_msg or "FATAL ERROR" in error_msg:
             return {
-                "answer": "The knowledge base is not available. Please ensure documents have been ingested by running the ingestion process.",
+                "answer": (
+                    "The knowledge base is not available. Please ensure "
+                    "documents have been ingested by running the ingestion process."
+                ),
                 "answer_type": "sagealpha_rag",
-                "sources": []
+                "sources": [],
             }
-        elif "CHROMA_API_KEY" in error_msg or "environment variable" in error_msg:
+        if "CHROMA_API_KEY" in error_msg or "environment variable" in error_msg:
             return {
-                "answer": "Service configuration error. Please check that all required environment variables are set correctly.",
+                "answer": (
+                    "Service configuration error. Please check that all "
+                    "required environment variables are set correctly."
+                ),
                 "answer_type": "sagealpha_rag",
-                "sources": []
+                "sources": [],
             }
-        else:
-            return {
-                "answer": f"I apologize, but I encountered an error while initializing the system: {error_msg}. Please contact support.",
-                "answer_type": "sagealpha_rag",
-                "sources": []
-            }
+        return {
+            "answer": (
+                f"I apologize, but I encountered an error while initializing "
+                f"the system: {error_msg}. Please contact support."
+            ),
+            "answer_type": "sagealpha_rag",
+            "sources": [],
+        }
+
+    except Exception as exc:
+        logger.exception(
+            "[POLICY_ROUTER] HARD FAILURE — policy execution aborted "
+            "(%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+        return {
+            "answer": (
+                "I apologize, but I encountered an error while processing "
+                "your query. Please try again."
+            ),
+            "answer_type": "sagealpha_rag",
+            "sources": [],
+        }

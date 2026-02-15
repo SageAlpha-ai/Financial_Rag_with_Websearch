@@ -22,13 +22,12 @@ lightweight model (gpt-4o-mini) to semantically analyse the query and produce
 an explicit, ordered execution plan.  This removes all keyword lists,
 hard-coded intents, and regex patterns from the routing decision.
 
-This module is still imported under two conditions:
-  - When ENABLE_QUERY_PLANNER is false (legacy fallback in app.py)
-  - When the planner path raises an exception and the system falls back to
-    legacy routing in answer_query_simple()
+This module is NO LONGER imported by any active code path.  The legacy
+intent-based routing branch in app.py has been removed and
+answer_query_simple() no longer falls back to legacy routing.
 
-Do NOT delete until the planner has been validated in production and the
-ENABLE_QUERY_PLANNER flag is permanently enabled.
+Retained as dead code for reference only.  Safe to delete once the
+single-brain architecture has been validated in production.
 """
 
 import logging
