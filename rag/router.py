@@ -32,17 +32,7 @@ def extract_entity_from_query(query: str) -> Optional[str]:
     query_lower = query.lower()
     
     entity_mappings = {
-        "oracle financial services": "Oracle Financial Services Software Ltd",
-        "oracle financial": "Oracle Financial Services Software Ltd",
-        "ofss": "Oracle Financial Services Software Ltd",
-        "microsoft": "Microsoft",
-        "apple": "Apple",
-        "google": "Google",
-        "amazon": "Amazon",
-        "meta": "Meta",
-        "facebook": "Meta",
-        "tesla": "Tesla",
-        "nvidia": "NVIDIA",
+        # Add generic aliases here if needed
     }
     
     for key, value in entity_mappings.items():

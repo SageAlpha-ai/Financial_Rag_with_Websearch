@@ -64,28 +64,7 @@ class CompanyValidator:
         
         # Check entity mappings FIRST (most reliable)
         entity_mappings = {
-            "oracle financial services software": "Oracle Financial Services Software Ltd",
-            "oracle financial services": "Oracle Financial Services Software Ltd",
-            "oracle financial": "Oracle Financial Services Software Ltd",
-            "ofss": "Oracle Financial Services Software Ltd",
-            "infosys limited": "Infosys Limited",
-            "infosys": "Infosys Limited",
-            "tcs": "Tata Consultancy Services Limited",
-            "tata consultancy services": "Tata Consultancy Services Limited",
-            "tata consultancy": "Tata Consultancy Services Limited",
-            "wipro limited": "Wipro Limited",
-            "wipro": "Wipro Limited",
-            "hcl technologies": "HCL Technologies Limited",
-            "hcl": "HCL Technologies Limited",
-            "icici bank": "ICICI Bank Limited",
-            "icici": "ICICI Bank Limited",
-            "icici bank limited": "ICICI Bank Limited",
-            "hdfc bank": "HDFC Bank Limited",
-            "hdfc": "HDFC Bank Limited",
-            "axis bank": "Axis Bank Limited",
-            "axis": "Axis Bank Limited",
-            "sbi": "State Bank of India",
-            "state bank of india": "State Bank of India",
+            # Add generic aliases here if needed
         }
         
         # Check for full company names first (longest match wins)
@@ -197,12 +176,7 @@ class CompanyValidator:
         
         # Check for common abbreviations and aliases
         abbreviations = {
-            "oracle financial services software": ["oracle financial services", "oracle financial", "ofss"],
-            "oracle financial services": ["oracle financial", "ofss"],
-            "tata consultancy services": ["tcs", "tata consultancy"],
-            "infosys limited": ["infosys"],
-            "wipro limited": ["wipro"],
-            "hcl technologies": ["hcl"],
+            "financial services software": ["financial services", "financial"],
         }
         
         # Check if both companies are in the same alias group

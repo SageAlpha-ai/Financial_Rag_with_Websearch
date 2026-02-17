@@ -7,7 +7,7 @@ Loaded once at startup, shared across all modules.
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 # Only load .env in local development (NOT in Docker or production)
 # In Docker/production, all config MUST come from environment variables
@@ -43,6 +43,7 @@ class AzureOpenAIConfig:
     endpoint: str
     api_version: str
     chat_deployment: str
+    planner_deployment: str
     embeddings_deployment: str
 
 
@@ -69,6 +70,9 @@ class AppConfig:
     azure_openai: AzureOpenAIConfig
     azure_blob: AzureBlobConfig
     chroma_cloud: ChromaCloudConfig
+    supported_companies: List[str]
+    enable_query_planner: bool
+    enable_web_search: bool
 
 
 def _get_required_env(var_name: str) -> str:
@@ -95,6 +99,7 @@ def load_config() -> AppConfig:
         endpoint=_get_required_env("AZURE_OPENAI_ENDPOINT"),
         api_version=_get_required_env("AZURE_OPENAI_API_VERSION"),
         chat_deployment=_get_required_env("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"),
+        planner_deployment=_get_optional_env("AZURE_OPENAI_PLANNER_CHAT_DEPLOYMENT_NAME"),
         embeddings_deployment=_get_required_env("AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME"),
     )
     
@@ -113,10 +118,21 @@ def load_config() -> AppConfig:
         collection_name=_get_optional_env("CHROMA_COLLECTION_NAME", "compliance"),
     )
     
+    # Supported Companies
+    supported_companies_str = _get_optional_env("SUPPORTED_COMPANIES", "")
+    supported_companies = [c.strip() for c in supported_companies_str.split(",") if c.strip()]
+    
+    # Feature Flags
+    enable_query_planner = _get_optional_env("ENABLE_QUERY_PLANNER", "false").lower() == "true"
+    enable_web_search = _get_optional_env("ENABLE_WEB_SEARCH", "false").lower() == "true"
+    
     return AppConfig(
         azure_openai=azure_openai,
         azure_blob=azure_blob,
         chroma_cloud=chroma_cloud,
+        supported_companies=supported_companies,
+        enable_query_planner=enable_query_planner,
+        enable_web_search=enable_web_search,
     )
 
 
@@ -161,7 +177,8 @@ def validate_config(config: AppConfig) -> None:
     logger.info("")
     logger.info("Loaded Configuration:")
     logger.info(f"  Endpoint: {config.azure_openai.endpoint[:50]}...")
-    logger.info(f"  Chat Deployment: {config.azure_openai.chat_deployment}")
+    logger.info(f"  Chat Deployment (Response): {config.azure_openai.chat_deployment}")
+    logger.info(f"  Chat Deployment (Planner): {config.azure_openai.planner_deployment or 'Not Set'}")
     logger.info(f"  Embeddings Deployment: {config.azure_openai.embeddings_deployment}")
     logger.info(f"  API Version: {config.azure_openai.api_version}")
     
@@ -177,6 +194,20 @@ def validate_config(config: AppConfig) -> None:
     logger.info(f"  Tenant: {config.chroma_cloud.tenant}")
     logger.info(f"  Database: {config.chroma_cloud.database}")
     logger.info(f"  Collection: {config.chroma_cloud.collection_name}")
+    
+    # Supported Companies
+    logger.info("")
+    logger.info("Supported Companies:")
+    if config.supported_companies:
+        for company in config.supported_companies:
+            logger.info(f"  - {company}")
+    else:
+        logger.warning("  WARNING: No companies supported (SUPPORTED_COMPANIES is empty)")
+    
+    logger.info("")
+    logger.info("Feature Flags:")
+    logger.info(f"  Query Planner: {'ENABLED' if config.enable_query_planner else 'DISABLED'}")
+    logger.info(f"  Web Search: {'ENABLED' if config.enable_web_search else 'DISABLED'}")
     
     logger.info("=" * 60)
 

@@ -629,200 +629,83 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
     Shared by both /query and /docs/query endpoints.
     """
     try:
-        # Get input from request model (supports both 'query' and 'question' for backward compatibility)
+        # Get input from request
         user_input = req.get_input()
         
         if not user_input or not user_input.strip():
             raise HTTPException(
                 status_code=400,
-                detail="Request body must contain either 'query' or 'question' field with non-empty text"
+                detail="Request body must contain 'query' or 'question'"
             )
         
-        # Normalize input to handle unstructured text, code, templates, etc.
+        # Normalize input
         normalized_input = normalize_user_input(user_input)
-        
-        if not normalized_input or not normalized_input.strip():
-            logger.warning(f"Input normalization resulted in empty string. Original length: {len(user_input)}")
-            raise HTTPException(
-                status_code=400,
-                detail="Input could not be normalized. Please provide valid text input."
-            )
         
         logger.info(f"[API] Processing query: {normalized_input[:100]}...")
         
-        # STEP 1: Classify query intent BEFORE routing
-        from rag.query_classifier import QueryClassifier
-        query_classification = QueryClassifier.classify_query(normalized_input)
-        intent = query_classification.get("intent", "financial_document_query")
+        # Determine intent (just for logging/metrics if needed, but we route EVERYTHING to orchestrator)
+        # We removed strict intent gating to ensure hybrid search works for all queries.
         
-        logger.info(f"[API] Query intent: {intent}")
-        
-        # STEP 2: Route based on intent
+        # Orchestrator Call
+        # This handles RAG, Web Search, and LLM fallback internally.
+        logger.info("[API] Delegating to orchestrator")
         try:
-            if intent == "greeting":
-                # Greetings - use LLM-only WITHOUT RAG initialization
-                logger.info("[API] Greeting detected - using LLM-only mode (no RAG initialization)")
-                # Sanitize input to prevent Azure jailbreak detection
-                sanitized_input = sanitize_llm_input(normalized_input)
-                if sanitized_input != normalized_input:
-                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                from rag.langchain_orchestrator import get_llm_only_chain
-                llm_chain = get_llm_only_chain()
-                answer = llm_chain.invoke({"question": sanitized_input})
-                result = {
-                    "answer": answer,
-                    "answer_type": "llm_fallback",
-                    "sources": []
-                }
-            elif intent == "general_knowledge":
-                # General knowledge - use LLM-only WITHOUT RAG initialization
-                logger.info("[API] General knowledge query - using LLM-only mode (no RAG initialization)")
-                # Sanitize input to prevent Azure jailbreak detection
-                sanitized_input = sanitize_llm_input(normalized_input)
-                if sanitized_input != normalized_input:
-                    logger.info(f"[API] Input sanitized: {normalized_input[:50]}... -> {sanitized_input[:50]}...")
-                from rag.langchain_orchestrator import get_llm_only_chain
-                llm_chain = get_llm_only_chain()
-                answer = llm_chain.invoke({"question": sanitized_input})
-                result = {
-                    "answer": answer,
-                    "answer_type": "llm_fallback",
-                    "sources": []
-                }
-            elif is_report_request(normalized_input):
-                # Long-format report generation (two-phase: RAG facts + LLM narrative)
-                logger.info("[API] Report generation mode detected")
-                result = generate_report(normalized_input)
-            else:
-                # Financial document query - use RAG pipeline
-                logger.info("[API] Financial document query - using RAG pipeline")
-                result = answer_query_simple(normalized_input)
-            
-            # Validate result structure
-            if not isinstance(result, dict):
-                logger.error(f"[API] Invalid result type: {type(result)}, expected dict")
-                raise ValueError("RAG pipeline returned invalid result format")
-            
-            # Ensure required keys exist
-            if "answer" not in result:
-                logger.error(f"[API] Result missing 'answer' key. Keys: {result.keys()}")
-                result["answer"] = "I apologize, but I encountered an error while processing your query."
-            
-            if "answer_type" not in result:
-                logger.warning("[API] Result missing 'answer_type' key, defaulting to 'sagealpha_rag'")
-                result["answer_type"] = "sagealpha_rag"
-            
-            if "sources" not in result:
-                logger.warning("[API] Result missing 'sources' key, defaulting to empty list")
-                result["sources"] = []
-            
-            logger.info(f"[API] Result keys: {list(result.keys())}")
-            logger.info(f"[API] Answer type: {result.get('answer_type')}")
-            logger.info(f"[API] Sources count: {len(result.get('sources', []))}")
-            
-        except RuntimeError as e:
-            # Handle ChromaDB initialization errors
-            error_msg = str(e)
-            if "ChromaDB collection is EMPTY" in error_msg or "FATAL ERROR" in error_msg:
-                logger.error(f"[API] ChromaDB error: {error_msg}")
-                raise HTTPException(
-                    status_code=503,
-                    detail="The knowledge base is not available. Please ensure documents have been ingested."
-                )
-            raise
-        except ValueError as e:
-            # Handle configuration errors
-            error_msg = str(e)
-            if "CHROMA_API_KEY" in error_msg or "environment variable" in error_msg.lower():
-                logger.error(f"[API] Configuration error: {error_msg}")
-                raise HTTPException(
-                    status_code=503,
-                    detail="Service configuration error. Please check environment variables."
-                )
-            raise
+            result = answer_query_simple(normalized_input)
+        except Exception as orchestrator_error:
+            # Fallback if orchestrator crashes completely
+            logger.error(f"[API] Orchestrator crashed: {orchestrator_error}", exc_info=True)
+            return QueryResponse(
+                answer="I apologize, but I encountered an internal error. Please try again later.",
+                answer_type="system_error",
+                sources=[]
+            )
+
+        # Validate result structure
+        if not isinstance(result, dict):
+            logger.error(f"[API] Invalid result type: {type(result)}")
+            raise ValueError("Orchestrator returned invalid format")
         
-        # Convert sources to SourceItem format if needed
-        # CRITICAL: Ensure sources are never null
-        formatted_sources = []
+        answer = result.get("answer", "No answer generated.")
+        answer_type = result.get("answer_type", "sagealpha_rag")
         sources = result.get("sources", [])
         
+        # Source Formatting
+        formatted_sources = []
         if sources:
-            if isinstance(sources, list) and len(sources) > 0:
+            for s in sources:
                 try:
-                    if isinstance(sources[0], dict):
-                        # Already in dict format - validate and convert to SourceItem
-                        for s in sources:
-                            try:
-                                # Try to create SourceItem from dict
-                                if "title" in s:
-                                    formatted_sources.append(SourceItem(
-                                        title=s.get("title", "Unknown"),
-                                        url=s.get("url"),
-                                        publisher=s.get("publisher")
-                                    ))
-                                else:
-                                    # Fallback: use first key as title
-                                    title = str(s.get(list(s.keys())[0] if s else "Unknown", "Unknown"))
-                                    formatted_sources.append(SourceItem(
-                                        title=title,
-                                        url=s.get("url"),
-                                        publisher=s.get("publisher")
-                                    ))
-                            except Exception as source_error:
-                                logger.warning(f"[API] Failed to format source item: {source_error}, source: {s}")
-                                # Create fallback source
-                                formatted_sources.append(SourceItem(
-                                    title=str(s) if s else "Unknown",
-                                    url=None,
-                                    publisher=None
-                                ))
+                    if isinstance(s, dict):
+                        formatted_sources.append(SourceItem(
+                            title=str(s.get("title", "Unknown")),
+                            url=s.get("url"),
+                            publisher=s.get("publisher")
+                        ))
+                    elif hasattr(s, 'title'): # Check if it's already a SourceItem or similar object
+                         formatted_sources.append(SourceItem(
+                            title=s.title,
+                            url=getattr(s, 'url', None),
+                            publisher=getattr(s, 'publisher', None)
+                        ))
                     else:
-                        # Convert string sources to SourceItem
-                        formatted_sources = [
-                            SourceItem(title=str(s), url=None, publisher=None) 
-                            for s in sources if s
-                        ]
-                except Exception as format_error:
-                    logger.error(f"[API] Error formatting sources: {format_error}", exc_info=True)
-                    # Fallback: create simple sources from strings
-                    formatted_sources = [
-                        SourceItem(title=str(s), url=None, publisher=None) 
-                        for s in sources if s
-                    ]
-        
-        logger.info(f"[API] Formatted {len(formatted_sources)} sources")
-        
-        # Ensure answer is a string
-        answer = str(result.get("answer", ""))
-        if not answer:
-            answer = "I apologize, but I could not generate an answer for your query."
+                        formatted_sources.append(SourceItem(title=str(s)))
+                except Exception as e:
+                    logger.warning(f"[API] Failed to format source: {s} - {e}")
+                    formatted_sources.append(SourceItem(title="Unknown Source"))
         
         return QueryResponse(
-            answer=answer,
-            answer_type=str(result.get("answer_type", "sagealpha_rag")),
-            sources=formatted_sources  # Always a list, never None
+            answer=str(answer),
+            answer_type=str(answer_type),
+            sources=formatted_sources
         )
+
     except HTTPException:
-        raise  # Re-raise HTTP exceptions as-is
+        raise
     except Exception as e:
-        # Log error server-side with full traceback
-        logger.error(f"[API] Query processing failed: {str(e)}", exc_info=True)
-        logger.error(f"[API] Exception type: {type(e).__name__}")
-        
-        # Provide more specific error messages for common issues
-        error_msg = str(e).lower()
-        if "chroma" in error_msg or "collection" in error_msg:
-            detail = "Database connection error. Please try again later."
-        elif "openai" in error_msg or "azure" in error_msg:
-            detail = "AI service error. Please try again later."
-        elif "timeout" in error_msg:
-            detail = "Request timeout. Please try again with a simpler query."
-        else:
-            detail = "An error occurred while processing your query. Please try again."
-        
-        raise HTTPException(
-            status_code=500,
-            detail=detail
+        logger.error(f"[API] Query processing failed: {e}", exc_info=True)
+        return QueryResponse(
+            answer="I apologize, but I encountered an unexpected error.",
+            answer_type="system_error",
+            sources=[]
         )
 
 

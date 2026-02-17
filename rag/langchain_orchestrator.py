@@ -15,6 +15,7 @@ import logging
 import os
 import re
 from typing import Dict, Any, List, Optional, Tuple
+import json
 
 from langchain_openai import AzureChatOpenAI, AzureOpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
@@ -85,9 +86,7 @@ def _extract_entity_from_query(query: str) -> Optional[str]:
     query_lower = query.lower()
     
     entity_mappings = {
-        "oracle financial services": "Oracle Financial Services Software Ltd",
-        "oracle financial": "Oracle Financial Services Software Ltd",
-        "ofss": "Oracle Financial Services Software Ltd",
+        # Generic variations can be added here if needed, but avoiding hardcoded business entities
     }
     
     for key, value in entity_mappings.items():
@@ -324,6 +323,21 @@ class LangChainOrchestrator:
             api_version=config.azure_openai.api_version,
             temperature=0.0,
         )
+        
+        # Initialize Planner LLM (if enabled)
+        self.planner_llm = None
+        if config.enable_query_planner and config.azure_openai.planner_deployment:
+            try:
+                self.planner_llm = AzureChatOpenAI(
+                    azure_endpoint=config.azure_openai.endpoint,
+                    azure_deployment=config.azure_openai.planner_deployment,
+                    api_key=config.azure_openai.api_key,
+                    api_version=config.azure_openai.api_version,
+                    temperature=0.0,
+                )
+                logger.info(f"[ORCHESTRATOR] Planner LLM initialized: {config.azure_openai.planner_deployment}")
+            except Exception as e:
+                logger.warning(f"[ORCHESTRATOR] Failed to initialize Planner LLM: {e}")
         
         # Azure OpenAI Embeddings (MUST match ingestion model)
         # For text-embedding-3-large, don't pass model parameter (deployment name is sufficient)
@@ -585,8 +599,10 @@ Answer:"""
                 company_name = _extract_entity_from_query(question)
             
             if not company_name:
-                logger.info("[WEB_SEARCH] No company name found in query")
-                return []
+                logger.info("[WEB_SEARCH] No company name found in query, using full query for general search")
+                # Fallback to general search if no company extracted
+                search_results = self.web_search.search_general(question)
+                return self._process_general_search_results(search_results)
             
             logger.info(f"[WEB_SEARCH] Searching for company: {company_name}")
             
@@ -681,601 +697,327 @@ Answer:"""
         except Exception as e:
             logger.error(f"[WEB_SEARCH] Web evidence retrieval failed: {e}", exc_info=True)
             return []
-    
-    def answer_query(self, question: str) -> Dict[str, Any]:
-        """
-        Enhanced orchestration with web search integration.
+
+    def _process_general_search_results(self, search_results: Dict[str, Any]) -> List[Dict]:
+        """Process results from general web search."""
+        if not search_results.get("success"):
+            logger.warning(f"[WEB_SEARCH] General search failed: {search_results.get('error')}")
+            return []
         
-        Flow:
-        1. ALWAYS retrieve documents from ChromaDB first
-        2. Check if web search should be triggered
-        3. If triggered, retrieve web evidence
-        4. Validate answerability
-        5. Fuse evidence from RAG + Web
-        6. Generate answer with trust-first guidelines
+        web_documents = []
+        for result in search_results.get("search_results", []):
+            web_documents.append({
+                "text": result.get("snippet", ""),
+                "metadata": {
+                    "source": "web_search",
+                    "title": result.get("title", ""),
+                    "url": result.get("link", ""),
+                    "type": "general_web"
+                }
+            })
+        return web_documents
+
+    def _probe_internal_knowledge(self, question: str) -> List[Dict]:
         """
-        # Initialize all variables with safe defaults to prevent UnboundLocalError
-        answer = ""
-        answer_type = "sagealpha_rag"
-        formatted_sources = []
-        rag_chain_executed = False
-        rag_chain_error = None
+        Lightweight Semantic Probe.
+        Checks if ChromaDB contains relevant documents for the query.
+        Returns top 3 documents if found, else empty list.
+        """
+        try:
+            # Generate embedding
+            query_embedding = self.embeddings.embed_query(question)
+            
+            # Fast query (using default collection)
+            results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=3,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            docs = results.get("documents", [[]])[0] if results.get("documents") else []
+            metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+            distances = results.get("distances", [[]])[0] if results.get("distances") else []
+            
+            # Filter by relevance threshold (e.g., distance < 1.0 for cosine distance)
+            # Only count as "Internal Knowledge" if reasonably close
+            relevant_docs = []
+            
+            for i, dist in enumerate(distances):
+                 # Threshold: 1.5 is generous for cosine distance (usually 0 to 2) 
+                 # Adjust based on your embedding model. 
+                 # For ada-002, < 0.3-0.4 is very close, < 0.5 is relevant.
+                 # Conservatively, we just check if ANY result was returned.
+                 relevant_docs.append({
+                     "content": docs[i],
+                     "metadata": metas[i],
+                     "distance": dist
+                 })
+            
+            return relevant_docs
+
+        except Exception as e:
+            logger.warning(f"[PROBE] Failed to probe internal knowledge: {e}")
+            return []
+
+    def _plan_query(self, question: str, has_internal_knowledge: bool = False, internal_match_count: int = 0) -> Dict[str, Any]:
+        """
+        Evidence-Aware Planner.
+        
+        Decides routing strategy based on:
+        1. Contextual signals (semantic match for RAG)
+        2. Query intent (real-time vs historical)
+        """
+        default_plan = {"mode": "rag", "reason": "Default fallback"}
         
         try:
+            if not self.planner_llm:
+                 return default_plan
+
+            planner_prompt = f"""You are an intelligent AI routing engine.
+
+You must decide how to answer a query.
+
+Signals provided:
+
+- has_internal_knowledge: {has_internal_knowledge}
+- internal_match_count: {internal_match_count}
+- Query: "{question}"
+
+Available modes:
+
+- "rag"     → Use internal knowledge only.
+- "web"     → Use web search only.
+- "hybrid"  → Use both internal knowledge and web.
+- "llm"     → Use model knowledge only.
+
+Rules:
+
+If strong internal semantic match exists and query is historical → prefer "rag".
+
+If query requires current, live, today, latest, realtime info → prefer "web".
+
+If both internal historical data AND latest update required → choose "hybrid".
+
+If no retrieval required → choose "llm".
+
+Return ONLY JSON:
+
+{{
+  "mode": "rag" | "web" | "hybrid" | "llm",
+  "reason": "short explanation"
+}}
+"""
+            response = self.planner_llm.invoke(planner_prompt)
+            
+            # Helper to clean response content
+            content = response.content.replace("```json", "").replace("```", "").strip()
+            
+            import json
+            plan = json.loads(content)
+            
+            mode = plan.get("mode", "rag").lower()
+            if mode not in ["rag", "web", "hybrid", "llm"]:
+                mode = "rag"
+            
+            return {
+                "mode": mode,
+                "reason": plan.get("reason", "No reason provided")
+            }
+
+        except Exception as e:
+            logger.warning(f"[PLANNER] Failed. Using safe fallback. Error: {e}")
+            
+            # Smart Fallback logic
+            if has_internal_knowledge:
+                return {"mode": "rag", "reason": "Fallback: Internal knowledge detected"}
+            else:
+                return {"mode": "llm", "reason": "Fallback: No internal knowledge detected"}
+
+    def answer_query(self, question: str) -> Dict[str, Any]:
+        """
+        Deterministic Orchestrator.
+        
+        Routing Logic:
+        1. Company Check (Supported vs Unsupported)
+        2. If Supported -> Semantic Search (ChromaDB)
+           - Strong Match (Similarity >= threshold) -> RAG Only
+           - Weak/No Match -> Hybrid (Web + LLM)
+        3. If Unsupported -> Web + LLM
+        """
+        try:
+            config = get_config()
             logger.info("[QUERY] Processing query")
             logger.info(f"[QUERY] Query text: {question}")
             
-            # STEP 0: Classify query to determine evidence requirements
-            query_classification = QueryClassifier.classify_query(question)
-            is_factual_financial = query_classification["is_factual_financial"]
-            requires_verified_source = query_classification["requires_verified_source"]
+            question_lower = question.lower()
             
-            logger.info(f"[CLASSIFIER] Query requires verified source: {requires_verified_source}")
+            # STEP 1: DETECT SUPPORTED COMPANY
+            matched_company = None
+            if config.supported_companies:
+                for company in config.supported_companies:
+                    if company in question_lower:
+                        matched_company = company
+                        break
             
-            # STEP 0.5: COMPANY-SPECIFIC ROUTING POLICY
-            # Check if query is about OFSS (the only company with verified RAG documents)
-            query_company = CompanyValidator._extract_company_from_query(question)
-            is_ofss_query = False
+            # Initialize evidence buckets
+            rag_docs = []
+            rag_metas = []
+            web_docs = []
+            distances = []
             
-            if query_company:
-                # Check if the company is Oracle Financial Services Software Ltd (OFSS)
-                ofss_variants = [
-                    "Oracle Financial Services Software Ltd",
-                    "Oracle Financial Services Software",
-                    "Oracle Financial Services",
-                    "Oracle Financial",
-                    "OFSS"
-                ]
-                query_company_normalized = query_company.lower().strip()
-                is_ofss_query = any(
-                    variant.lower().strip() in query_company_normalized or 
-                    query_company_normalized in variant.lower().strip()
-                    for variant in ofss_variants
-                )
+            # STEP 2: IF SUPPORTED COMPANY -> TRY SEMANTIC RAG
+            if matched_company:
+                logger.info(f"[ROUTER] Supported company detected: {matched_company}")
+                logger.info("[ROUTER] Running semantic similarity search in ChromaDB")
                 
-                logger.info("=" * 60)
-                logger.info("[ROUTER] COMPANY-SPECIFIC ROUTING DECISION")
-                logger.info("=" * 60)
-                logger.info(f"Query company: {query_company}")
-                logger.info(f"Is OFSS query: {is_ofss_query}")
+                # Perform retrieval (we use existing method which handles embeddings + year filtering)
+                # Note: To get scores, we need to query collection directly or modify retriever.
+                # For simplicity and robustness, we use the raw collection query here for routing decision.
                 
-                if is_ofss_query:
-                    logger.info("[ROUTER] ✓ OFSS query detected → Using RAG pipeline with strict evidence gate")
-                else:
-                    logger.info(f"[ROUTER] ⚠ Non-OFSS company ({query_company}) → Skipping RAG, using LLM with disclaimer")
-                    logger.info("[ROUTER] RAG knowledge base only contains verified OFSS documents")
-                logger.info("=" * 60)
-            
-            # STEP 1: CONDITIONAL RAG RETRIEVAL
-            # CRITICAL RULE: Only perform RAG retrieval for OFSS queries
-            # If company is not detected OR is non-OFSS → Skip RAG entirely
-            documents = []
-            metadatas = []
-            
-            if is_ofss_query:
-                logger.info("[RETRIEVER] Starting RAG retrieval for OFSS query...")
-                documents, metadatas = self._retrieve_documents_hybrid(question)
-            else:
-                if query_company:
-                    logger.info(f"[ROUTER] Skipping RAG retrieval for non-OFSS company: {query_company}")
-                    logger.info("[ROUTER] Will use LLM-only answer with appropriate disclaimer")
-                    logger.info("[ROUTER] RAG knowledge base only contains verified OFSS documents")
-                else:
-                    # CRITICAL: No company detected → Use LLM only (never use RAG)
-                    logger.warning("=" * 60)
-                    logger.warning("[ROUTER] COMPANY NOT DETECTED → LLM-ONLY MODE")
-                    logger.warning("=" * 60)
-                    logger.warning("Company name could not be extracted from query")
-                    logger.warning("RAG is ONLY allowed for verified OFSS queries")
-                    logger.warning("Skipping RAG retrieval to prevent cross-company contamination")
-                    logger.warning("Using LLM-only answer with disclaimer")
-                    logger.warning("=" * 60)
-            
-            # STEP 1.5: Validate company match to prevent cross-company contamination
-            # Only validate if we have documents AND the query mentions a specific company
-            # For OFSS queries, ensure we only use OFSS documents
-            if documents and metadatas and query_company:
-                logger.info(f"[VALIDATOR] Validating company name match (query company: '{query_company}')...")
-                original_count = len(documents)
-                documents, metadatas, rejected = CompanyValidator.validate_company_match(
-                    question, documents, metadatas
-                )
-                if rejected:
-                    logger.warning(f"[VALIDATOR] Rejected {len(rejected)} documents due to company mismatch")
-                    logger.info(f"[VALIDATOR] Kept {len(documents)}/{original_count} documents after company validation")
-            elif documents and metadatas:
-                logger.info("[VALIDATOR] No company name detected in query, skipping company validation")
-            
-            # Get similarity scores for decision logic (distances from ChromaDB)
-            # Note: ChromaDB returns distances (lower = more similar), not similarity scores
-            similarity_scores = []
-            max_distance = 1.0  # Threshold for confidence gating (lower = more strict)
-            if documents:
-                # Get distances from the retrieval we just did
                 try:
-                    chroma_results = self.collection.query(
-                        query_embeddings=[self.embeddings.embed_query(question)],
+                    query_embedding = self.embeddings.embed_query(question)
+                    results = self.collection.query(
+                        query_embeddings=[query_embedding],
                         n_results=5,
-                        include=["distances"]
+                        include=["documents", "metadatas", "distances"]
                     )
-                    similarity_scores = chroma_results.get("distances", [[]])[0] if chroma_results.get("distances") else []
-                    if similarity_scores:
-                        max_distance = max(similarity_scores[:len(documents)])  # Get max distance for retrieved docs
-                except:
-                    similarity_scores = []
-            
-            logger.info(f"[DEBUG] Retrieved docs count: {len(documents)}")
-            if similarity_scores:
-                logger.info(f"[DEBUG] Max similarity distance: {max_distance:.4f} (lower = more similar)")
-            
-            # RETRIEVAL CONFIDENCE GATING: Skip RAG if no documents OR low confidence
-            # ChromaDB distances: lower = more similar, typical range 0.0-2.0
-            # Threshold: 1.5 means only very similar documents are used
-            retrieval_confidence_threshold = 1.5  # Distance threshold (lower = more strict)
-            has_high_confidence = len(documents) > 0 and (not similarity_scores or max_distance < retrieval_confidence_threshold)
-            
-            if not documents:
-                # No documents retrieved - return safe message for financial queries
-                if requires_verified_source:
-                    logger.warning("=" * 60)
-                    logger.warning("[RETRIEVAL_GATE] BLOCKED: No documents retrieved for factual financial query")
-                    logger.warning("=" * 60)
-                    logger.warning("This information is not available in the internal documents.")
-                    logger.warning("=" * 60)
                     
-                    return {
-                        "answer": "This information is not available in the internal documents.",
-                        "answer_type": "sagealpha_rag",
-                        "sources": []
-                    }
-            elif similarity_scores and max_distance >= retrieval_confidence_threshold:
-                # Documents retrieved but similarity is too low - return safe message
-                if requires_verified_source:
-                    logger.warning("=" * 60)
-                    logger.warning("[RETRIEVAL_GATE] BLOCKED: Low retrieval confidence")
-                    logger.warning("=" * 60)
-                    logger.warning(f"Documents retrieved: {len(documents)}")
-                    logger.warning(f"Max similarity distance: {max_distance:.4f} (threshold: {retrieval_confidence_threshold})")
-                    logger.warning("Retrieved documents are not sufficiently relevant to answer this query.")
-                    logger.warning("This information is not available in the internal documents.")
-                    logger.warning("=" * 60)
+                    raw_docs = results.get("documents", [[]])[0] if results.get("documents") else []
+                    raw_metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+                    raw_distances = results.get("distances", [[]])[0] if results.get("distances") else []
                     
-                    return {
-                        "answer": "This information is not available in the internal documents.",
-                        "answer_type": "sagealpha_rag",
-                        "sources": []
-                    }
-            
-            # STEP 2: Decide if web search should be triggered
-            # Only trigger web search for OFSS queries (or queries without company specified)
-            web_documents = []
-            
-            if is_ofss_query or not query_company:
-                # For OFSS queries or general queries, consider web search
-                should_search, search_reason = should_trigger_web_search(
-                    question,
-                    documents,
-                    metadatas,
-                    similarity_scores
-                )
-                
-                if should_search:
-                    logger.info(f"[WEB_SEARCH] Triggering web search: {search_reason}")
-                    web_documents = self._retrieve_web_evidence(question)
-                else:
-                    logger.info(f"[WEB_SEARCH] Skipping web search: {search_reason}")
-            else:
-                # For non-OFSS companies, skip web search (will use LLM-only)
-                logger.info(f"[WEB_SEARCH] Skipping web search for non-OFSS company: {query_company}")
-            
-            # STEP 3: COMPANY-SPECIFIC EVIDENCE GATE
-            # Apply strict evidence gate ONLY for OFSS queries
-            # For non-OFSS companies or undetected companies, allow LLM answers with disclaimer
-            
-            # CRITICAL: If no company detected, skip RAG entirely and use LLM-only
-            if not query_company:
-                logger.info("=" * 60)
-                logger.info("[RESPONSE TYPE] LLM-ONLY (Company Not Detected)")
-                logger.info("=" * 60)
-                logger.info("Company name could not be extracted from query")
-                logger.info("RAG is ONLY allowed for verified OFSS queries")
-                logger.info("Using LLM to answer based on publicly available information")
-                logger.info("=" * 60)
-                
-                # Use LLM with disclaimer prompt
-                llm_prompt_with_disclaimer = f"""You are a financial assistant.
-
-Answer the user's question using general public financial knowledge.
-
-IMPORTANT CONSTRAINTS:
-- If exact audited figures are uncertain, say so clearly
-- Do not claim access to internal or proprietary documents
-- Provide approximate or reported values when exact figures are unavailable
-- Be transparent about data sources
-
-Question: {question}
-
-Always include this disclaimer at the end:
-"This answer is based on publicly available information and may not be officially verified. For verified financial data, please refer to the company's official investor relations website or annual reports."
-
-Answer:"""
-                
-                answer = self.llm_only_chain.invoke({"question": llm_prompt_with_disclaimer})
-                logger.info("[LLM] Answer generated with disclaimer (company not detected)")
-                
-                answer_type = "sagealpha_rag"
-                logger.info(f"[RESPONSE] answer_type={answer_type} (LLM-only, company not detected)")
-                
-                # Create source indicating it's from general knowledge
-                llm_sources = [{
-                    "title": "Public Financial Information",
-                    "publisher": "SageAlpha AI",
-                    "url": None,
-                    "note": "Answer generated from publicly available information. For verified financial data, please refer to the company's official investor relations website or annual reports."
-                }]
-                
-                return {
-                    "answer": answer,
-                    "answer_type": answer_type,
-                    "sources": llm_sources
-                }
-            
-            if not documents and not web_documents:
-                # No documents retrieved
-                logger.warning("[ROUTER] No documents retrieved")
-                
-                if is_ofss_query:
-                    # OFSS query but no documents - apply strict evidence gate
-                    logger.warning("[ROUTER] This may indicate:")
-                    logger.warning("[ROUTER] 1. ChromaDB collection is empty or not properly indexed")
-                    logger.warning("[ROUTER] 2. Query embeddings don't match stored embeddings")
-                    logger.warning("[ROUTER] 3. Company validator rejected all documents")
+                    # Store for use
+                    rag_docs = raw_docs
+                    rag_metas = raw_metas
+                    distances = raw_distances
                     
-                    # ABSOLUTE RULE: For OFSS queries, BLOCK LLM answer if no verified sources
-                    if requires_verified_source:
-                        logger.error("[EVIDENCE_GATE] BLOCKED: OFSS factual financial query without verified sources")
-                        logger.error("[EVIDENCE_GATE] LLM is NOT allowed to answer OFSS factual questions without sources")
+                    # Calculate match strength
+                    # Chroma returns L2/Cosine distance. Lower is better.
+                    # Assumption: 0.0 is exact match.
+                    # User threshold: Similarity >= 0.75.
+                    # If using Cosine Distance (range 0-1 usually, max 2): Similarity ~= 1 - Distance.
+                    # So 1 - Distance >= 0.75 => Distance <= 0.25.
+                    # We'll use a configurable threshold logic.
+                    
+                    is_strong_match = False
+                    if distances:
+                        min_distance = min(distances)
+                        logger.info(f"[ROUTER] Best semantic distance: {min_distance}")
                         
-                        return {
-                            "answer": "The requested information could not be verified from official sources.",
-                            "answer_type": "sagealpha_ai_search",
-                            "sources": []
-                        }
+                        # Threshold: 0.35 is a reasonable strict cutoff for ada-002 / text-embedding-3-small
+                        # Adjusting to be roughly equivalent to 0.75 similarity
+                        if min_distance <= 0.4:
+                            is_strong_match = True
+                            logger.info(f"[ROUTER] Strong semantic match (distance {min_distance} <= 0.4)")
+                        else:
+                            logger.info(f"[ROUTER] Weak semantic match (distance {min_distance} > 0.4)")
                     
-                    # Non-factual OFSS query - allow LLM fallback
-                    logger.warning("=" * 60)
-                    logger.warning("[RESPONSE TYPE] LLM FALLBACK (No RAG documents for OFSS)")
-                    logger.warning("=" * 60)
-                    logger.warning("No documents retrieved from ChromaDB. Using LLM-only answer.")
-                    logger.warning("To enable RAG answers, run: python ingest.py --fresh")
-                    logger.warning("=" * 60)
-                    answer = self.llm_only_chain.invoke({"question": question})
-                    logger.info("[LLM] Answer generated from general knowledge")
-                    
-                    answer_type = "sagealpha_rag"
-                    logger.info(f"[RESPONSE] answer_type={answer_type} (LLM fallback, no sources)")
-                    
-                    llm_sources = [{
-                        "title": "General Knowledge Base",
-                        "publisher": "SageAlpha AI",
-                        "note": "Answer generated from general knowledge. For verified financial data, please ensure relevant documents are indexed in the knowledge base."
-                    }]
-                    
-                    return {
-                        "answer": answer,
-                        "answer_type": answer_type,
-                        "sources": llm_sources
-                    }
+                except Exception as e:
+                    logger.error(f"[ROUTER] Semantic search failed: {e}")
+                    is_strong_match = False
+                
+                if is_strong_match:
+                    # RAG ONLY PATH
+                    mode = "rag"
+                    # rag_docs and rag_metas are already populated
                 else:
-                    # Non-OFSS company - allow LLM answer with disclaimer
-                    logger.info("=" * 60)
-                    logger.info("[RESPONSE TYPE] LLM-ONLY (Non-OFSS Company)")
-                    logger.info("=" * 60)
-                    logger.info(f"Query is about {query_company} (not OFSS)")
-                    logger.info("RAG knowledge base only contains verified OFSS documents")
-                    logger.info("Using LLM to answer based on publicly available information")
-                    logger.info("=" * 60)
-                    
-                    # Use LLM with disclaimer prompt
-                    llm_prompt_with_disclaimer = f"""You are a financial assistant.
-
-Answer the user's question about {query_company} using general public financial knowledge.
-
-IMPORTANT CONSTRAINTS:
-- If exact audited figures are uncertain, say so clearly
-- Do not claim access to internal or proprietary documents
-- Provide approximate or reported values when exact figures are unavailable
-- Be transparent about data sources
-
-Question: {question}
-
-Always include this disclaimer at the end:
-"This answer is based on publicly available information and may not be officially verified. For verified financial data, please refer to the company's official investor relations website or annual reports."
-
-Answer:"""
-                    
-                    answer = self.llm_only_chain.invoke({"question": llm_prompt_with_disclaimer})
-                    logger.info("[LLM] Answer generated with disclaimer for non-OFSS company")
-                    
-                    answer_type = "sagealpha_rag"
-                    logger.info(f"[RESPONSE] answer_type={answer_type} (LLM-only, non-OFSS company)")
-                    
-                    # Create source indicating it's from general knowledge
-                    llm_sources = [{
-                        "title": "Public Financial Information",
-                        "publisher": "SageAlpha AI",
-                        "url": None,
-                        "note": f"Answer generated from publicly available information about {query_company}. For verified financial data, please refer to the company's official investor relations website or annual reports."
-                    }]
-                    
-                    return {
-                        "answer": answer,
-                        "answer_type": answer_type,
-                        "sources": llm_sources
-                    }
+                    # WEAK/NO MATCH -> HYBRID PATH
+                    mode = "hybrid"
+                    logger.info("[ROUTER] Switching to HYBRID (Web + LLM)")
+                    web_docs = self._retrieve_web_evidence(question)
             
-            # STEP 4: Validate answerability (if we have RAG docs)
-            is_answerable = True
-            reason = "Documents available"
-            validation_details = {}
+            # STEP 3: UNSUPPORTED COMPANY -> WEB + LLM
+            else:
+                mode = "web"
+                logger.info("[ROUTER] Unsupported/General query -> using WEB + LLM")
+                web_docs = self._retrieve_web_evidence(question)
+
+                # Fallback to LLM only if web fails
+                if not web_docs:
+                    mode = "llm"
             
-            if documents:
-                logger.info("[VALIDATE] Starting answerability validation...")
-                is_answerable, reason, validation_details = _validate_answerability(question, documents, metadatas)
+            logger.info(f"[ROUTER] Final Mode: {mode.upper()}")
             
-            # If RAG docs not answerable but we have web docs, still proceed
-            if not is_answerable and web_documents:
-                logger.info("[VALIDATE] RAG docs not answerable, but web docs available - proceeding")
-                is_answerable = True
-                reason = "Web documents available"
+            # STEP 4: EXECUTE & SYNTHESIZE
             
-            if not is_answerable and not web_documents:
-                # Documents retrieved but don't match requirements and no web docs → RAG_NO_ANSWER
-                logger.warning(f"[ROUTER] Documents not answerable → RAG_NO_ANSWER")
-                logger.info(f"[ROUTER] Reason: {reason}")
-                
-                # Build informative answer
-                requested_year = validation_details.get("requested_year")
-                requested_entity = validation_details.get("requested_entity")
-                
-                answer_parts = []
-                if requested_year:
-                    answer_parts.append(f"FY{requested_year[2:]} data")
-                if requested_entity:
-                    answer_parts.append(f"{requested_entity} data")
-                
-                if answer_parts:
-                    answer = f"The requested {', '.join(answer_parts)} is not available in the documents."
-                else:
-                    answer = "The requested information is not available in the documents."
-                
-                # Extract sources
-                sources = []
-                for meta in metadatas:
-                    source_info = meta.get("source", meta.get("filename", "unknown"))
-                    if meta.get("page"):
-                        source_info += f" (page {meta.get('page')})"
-                    if meta.get("fiscal_year"):
-                        source_info += f" (FY: {meta.get('fiscal_year')})"
-                    sources.append(source_info)
-                
-                answer_type = "sagealpha_rag"  # Still use RAG branding even if no answer
-                logger.info(f"[RESPONSE] answer_type={answer_type}")
-                logger.info("[RESPONSE] Returning answer to user")
-                
-                # Format sources (CRITICAL: Always populate sources for RAG answers)
-                formatted_sources = SourceFormatter.format_sources(metadatas, [])
-                
-                # Ensure sources are never null/empty
-                if not formatted_sources and metadatas:
-                    logger.warning("[SOURCE] Formatter returned empty sources for RAG_NO_ANSWER, creating fallback")
-                    formatted_sources = SourceFormatter._create_fallback_sources(metadatas)
-                
+            if mode == "llm":
+                logger.info("[ROUTER] LLM-only execution")
+                chain = get_llm_only_chain()
+                answer = chain.invoke({"question": question})
                 return {
                     "answer": answer,
-                    "answer_type": answer_type,
-                    "sources": formatted_sources if formatted_sources else []  # Never null
+                    "answer_type": "sagealpha_llm",
+                    "sources": []
                 }
             
-            # STEP 5: Fuse evidence from RAG + Web
-            logger.info("[ROUTER] Fusing evidence from RAG + Web Search")
+            # Determine answer type string
+            if rag_docs and web_docs:
+                answer_type = "sagealpha_hybrid_search"
+            elif rag_docs:
+                answer_type = "sagealpha_rag"
+            elif web_docs:
+                answer_type = "sagealpha_ai_search"
+            else:
+                answer_type = "llm_fallback"
             
+            # Fuse Evidence
             fusion_result = EvidenceFusion.fuse_evidence(
-                documents,
-                metadatas,
-                web_documents,
+                rag_docs,
+                rag_metas,
+                web_docs,
                 question
             )
             
             fused_context = fusion_result.get("fused_context", "")
-            fused_sources = fusion_result.get("sources", [])
-            evidence_priority = fusion_result.get("evidence_priority", "rag_internal")
             
-            # STEP 6: Generate answer using fused context
-            logger.info("[RAG] Sending fused context + query to LLM")
+            # Final Synthesis
+            system_prompt = """You are a financial AI assistant.
+
+Use the following context sources to answer the user question.
+
+CONTEXT:
+{context}
+
+Guidelines:
+1. Synthesize information from the provided context.
+2. If web data is more recent (e.g., stock price), prioritize it.
+3. If internal documents provide specific details, prioritize them.
+4. If no context is provided, answer using your general knowledge but mention that no specific documents were found.
+
+Question:
+{question}
+
+Answer:"""
+
+            generation_prompt = ChatPromptTemplate.from_messages([
+                ("system", system_prompt),
+                ("user", "{question}")
+            ])
             
-            # Track whether RAG chain actually executed successfully
-            # (rag_chain_executed already initialized at function start)
+            final_context = fused_context if fused_context else "No specific documents found. Answer based on general knowledge."
             
-            try:
-                if fused_context:
-                    answer = self.rag_chain.invoke({"question": question, "context": fused_context})
-                else:
-                    # Fallback if fusion failed
-                    context_parts = []
-                    for doc, meta in zip(documents, metadatas):
-                        meta_info = ""
-                        if meta.get("source"):
-                            meta_info = f"Source: {meta.get('source')}"
-                        if meta.get("fiscal_year"):
-                            meta_info += f", FY: {meta.get('fiscal_year')}"
-                        if meta.get("page"):
-                            meta_info += f", Page: {meta.get('page')}"
-                        if meta_info:
-                            context_parts.append(f"[{meta_info}]\n{doc}")
-                        else:
-                            context_parts.append(doc)
-                    
-                    fused_context = "\n\n---\n\n".join(context_parts)
-                    answer = self.rag_chain.invoke({"question": question, "context": fused_context})
-                
-                rag_chain_executed = True
-                logger.info("[RAG] Answer generated from retrieved documents")
-                
-            except Exception as rag_error:
-                rag_chain_error = rag_error
-                error_msg = str(rag_error)
-                
-                # Get config for error messages
-                config = get_config()
-                
-                logger.error("=" * 60)
-                logger.error("[RAG CHAIN] FAILED - Azure OpenAI deployment error")
-                logger.error("=" * 60)
-                logger.error(f"Error type: {type(rag_error).__name__}")
-                logger.error(f"Error message: {error_msg}")
-                
-                # Check if it's a deployment error
-                if "NotFound" in error_msg or "404" in error_msg or "deployment" in error_msg.lower():
-                    logger.error("This is an Azure OpenAI deployment configuration error.")
-                    logger.error(f"Chat deployment '{config.azure_openai.chat_deployment}' may not exist.")
-                    logger.error("Check Azure Portal → Deployments to verify the deployment name.")
-                
-                logger.error("=" * 60)
-                logger.error("Falling back to LLM-only mode (no RAG context)")
-                logger.error(f"Reason: RAG chain execution failed - {error_msg[:100]}")
-                logger.error("=" * 60)
-                
-                # Fallback to LLM-only (but we still have documents, so this is a generation failure)
-                try:
-                    answer = self.llm_only_chain.invoke({"question": question})
-                    logger.warning("[FALLBACK] LLM-only answer generated (RAG chain failed)")
-                    logger.warning(f"[FALLBACK] Mode: llm_fallback | Reason: RAG chain error - {type(rag_error).__name__}")
-                except Exception as llm_error:
-                    # Even LLM fallback failed - this is a critical error
-                    logger.error(f"[CRITICAL] LLM fallback also failed: {llm_error}")
-                    raise RuntimeError(
-                        f"Both RAG and LLM generation failed. "
-                        f"RAG error: {rag_error}, LLM error: {llm_error}"
-                    ) from llm_error
+            chain = generation_prompt | self.llm | StrOutputParser()
             
-            # Get config for answer type determination (needed for error messages)
-            config = get_config()
+            logger.info("[GENERATOR] Generating final answer...")
+            answer = chain.invoke({
+                "question": question,
+                "context": final_context
+            })
             
-            # Determine answer type based on whether RAG chain executed AND what sources we have
-            # CRITICAL: answer_type reflects HOW the answer was generated, not just source count
-            # If RAG chain executed successfully, it's RAG (even if sources are empty)
-            # If RAG chain failed, we still label based on documents retrieved (but log the failure)
-            
-            if rag_chain_executed:
-                # RAG chain succeeded - this is a true RAG answer
-                if web_documents and documents:
-                    answer_type = "sagealpha_hybrid_search"
-                    logger.info("=" * 60)
-                    logger.info("[RESPONSE TYPE] HYBRID SEARCH (RAG + Web Search)")
-                    logger.info("=" * 60)
-                    logger.info(f"✓ RAG chain executed successfully")
-                    logger.info(f"Using {len(documents)} RAG documents + {len(web_documents)} web documents")
-                    logger.info("=" * 60)
-                elif web_documents:
-                    answer_type = "sagealpha_ai_search"
-                    logger.info("=" * 60)
-                    logger.info("[RESPONSE TYPE] WEB SEARCH ONLY")
-                    logger.info("=" * 60)
-                    logger.info(f"✓ RAG chain executed successfully")
-                    logger.info(f"Using {len(web_documents)} web documents (no RAG documents found)")
-                    logger.info("=" * 60)
-                elif documents:
-                    answer_type = "sagealpha_rag"
-                    logger.info("=" * 60)
-                    logger.info("[RESPONSE TYPE] RAG (Internal Documents)")
-                    logger.info("=" * 60)
-                    logger.info(f"✓ RAG chain executed successfully")
-                    logger.info(f"Using {len(documents)} documents from ChromaDB")
-                    logger.info("=" * 60)
-                else:
-                    # RAG executed but no documents - this shouldn't happen but handle it
-                    answer_type = "sagealpha_rag"
-                    logger.warning("[RESPONSE TYPE] RAG executed but no documents (unexpected)")
-            else:
-                # RAG chain failed - we fell back to LLM-only
-                # BUT: We still have documents, so this is a generation failure, not a retrieval failure
-                # We label based on what documents we retrieved (to show we tried RAG)
-                if documents or web_documents:
-                    # We have documents but RAG generation failed - still label as RAG type (with warning)
-                    if web_documents and documents:
-                        answer_type = "sagealpha_hybrid_search"
-                    elif web_documents:
-                        answer_type = "sagealpha_ai_search"
-                    else:
-                        answer_type = "sagealpha_rag"
-                    
-                    logger.warning("=" * 60)
-                    logger.warning(f"[RESPONSE TYPE] {answer_type.upper()} (RAG GENERATION FAILED - LLM FALLBACK)")
-                    logger.warning("=" * 60)
-                    logger.warning(f"Mode: llm_fallback")
-                    logger.warning(f"Reason: RAG chain execution failed despite documents being retrieved")
-                    logger.warning(f"⚠ Documents retrieved ({len(documents)} RAG + {len(web_documents)} web)")
-                    logger.warning(f"⚠ But RAG chain failed - using LLM-only answer")
-                    logger.warning(f"⚠ This indicates Azure OpenAI deployment configuration issue")
-                    logger.warning(f"⚠ Check: AZURE_OPENAI_CHAT_DEPLOYMENT_NAME={config.azure_openai.chat_deployment}")
-                    logger.warning(f"⚠ RAG error: {str(rag_chain_error)[:200] if rag_chain_error else 'Unknown'}")
-                    logger.warning("=" * 60)
-                else:
-                    # No documents AND RAG failed - this is a true LLM fallback
-                    answer_type = "llm_fallback"
-                    logger.warning("=" * 60)
-                    logger.warning("[RESPONSE TYPE] LLM FALLBACK (No documents + RAG failed)")
-                    logger.warning("=" * 60)
-                    logger.warning("Mode: llm_fallback")
-                    logger.warning(f"Reason: No documents retrieved AND RAG chain failed")
-                    logger.warning(f"RAG error: {str(rag_chain_error)[:200] if rag_chain_error else 'Unknown'}")
-                    logger.warning("=" * 60)
-            
-            # Format sources using SourceFormatter (hides internal paths, shows official URLs)
-            # (formatted_sources already initialized at function start, but we'll set it here)
-            formatted_sources = SourceFormatter.format_sources(metadatas, web_documents)
-            
-            logger.info(f"[RESPONSE] answer_type={answer_type}")
-            logger.info(f"[RESPONSE] sources_count={len(formatted_sources) if formatted_sources else 0}")
-            logger.info("[RESPONSE] Returning answer to user")
-            
-            # CRITICAL: Ensure sources are never null/empty for RAG answers
-            if not formatted_sources:
-                if documents and metadatas:
-                    # Fallback: Create sources from metadatas even if formatter returns empty
-                    logger.warning("[SOURCE] Formatter returned empty sources, creating fallback sources")
-                    formatted_sources = SourceFormatter._create_fallback_sources(metadatas)
-                elif web_documents:
-                    # Fallback for web documents
-                    logger.warning("[SOURCE] Formatter returned empty sources for web docs, creating fallback")
-                    web_metas = [doc.get("metadata", {}) for doc in web_documents]
-                    formatted_sources = SourceFormatter._create_fallback_sources(web_metas)
-            
-            # ABSOLUTE RULE: If factual financial query and no sources, BLOCK answer
-            if requires_verified_source and not formatted_sources:
-                logger.error("[EVIDENCE_GATE] BLOCKED: Factual financial query with no sources after formatting")
-                return {
-                    "answer": "The requested information could not be verified from official sources.",
-                    "answer_type": answer_type,
-                    "sources": []  # Empty sources indicate no verified data
-                }
-            
-            # Validate sources are non-empty (should be guaranteed by above logic)
-            if not formatted_sources:
-                logger.warning("[SOURCE] WARNING: Sources array is empty - this should not happen")
+            # Format sources
+            formatted_sources = SourceFormatter.format_sources(rag_metas, web_docs)
             
             return {
                 "answer": answer,
                 "answer_type": answer_type,
-                "sources": formatted_sources if formatted_sources else []  # Never null
+                "sources": formatted_sources if formatted_sources else []
             }
-            
+
         except Exception as e:
-            logger.error(f"LangChain orchestration failed: {e}", exc_info=True)
+            logger.exception("LangChain orchestration failed")
             return {
-                "answer": "I apologize, but I encountered an error while processing your query. Please try again.",
-                "answer_type": "sagealpha_rag",
+                "answer": "I encountered an internal error while processing your request, but here is my best possible response based on available knowledge.",
+                "answer_type": "llm_fallback",
                 "sources": []
             }
     

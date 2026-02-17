@@ -324,7 +324,46 @@ class WebSearchEngine:
             
         except Exception as e:
             logger.error(f"[WEB_SEARCH] Document search failed: {e}", exc_info=True)
-            return []
+    def search_general(self, query: str) -> Dict[str, any]:
+        """
+        Perform a general web search for the query when no specific company is detected.
+        Useful for market queries, sector analysis, or general financial questions.
+        """
+        if not self.enabled:
+            return {
+                "search_results": [],
+                "success": False,
+                "error": "Web search not enabled"
+            }
+        
+        try:
+            logger.info(f"[WEB_SEARCH] Performing general search for: {query}")
+            
+            params = {
+                "q": query,
+                "api_key": self.api_key,
+                "engine": "google",
+                "num": 5
+            }
+            
+            search = GoogleSearch(params)
+            results = search.get_dict()
+            organic_results = results.get("organic_results", [])
+            
+            logger.info(f"[WEB_SEARCH] Found {len(organic_results)} general results")
+            
+            return {
+                "search_results": organic_results,
+                "success": True
+            }
+            
+        except Exception as e:
+            logger.error(f"[WEB_SEARCH] General search failed: {e}", exc_info=True)
+            return {
+                "search_results": [],
+                "success": False,
+                "error": str(e)
+            }
 
 
 def should_trigger_web_search(
