@@ -258,6 +258,11 @@ class QueryRequest(BaseModel):
         max_length=5000,
         examples=["What is the revenue of Oracle Financial Services for FY2023?"]
     )
+    strict_json: Optional[bool] = Field(
+        False,
+        description="If True, strictly enforces JSON output format for Node.js integration",
+        examples=[False]
+    )
     
     @model_validator(mode='after')
     def validate_at_least_one_field(self):
@@ -367,8 +372,7 @@ def validate_azure_openai_deployments(config) -> None:
                 "api_key": config.azure_openai.api_key,
                 "api_version": config.azure_openai.api_version,
             }
-            if "text-embedding-ada-002" in config.azure_openai.embeddings_deployment.lower():
-                embedding_kwargs["model"] = "text-embedding-ada-002"
+
             
             test_embeddings = AzureOpenAIEmbeddings(**embedding_kwargs)
             # Make a minimal test call
@@ -453,7 +457,7 @@ async def lifespan(app: FastAPI):
                 doc_count = collection.count()
                 logger.info(f"Collection '{collection.name}' ready with {doc_count} documents")
                 if doc_count == 0:
-                    logger.warning("Collection is empty. Run 'python ingest.py --fresh' to populate it.")
+                    logger.warning("Collection is empty. Ensure data is ingested via the external pipeline.")
                 logger.info("=" * 60)
             else:
                 logger.info("=" * 60)
@@ -464,7 +468,7 @@ async def lifespan(app: FastAPI):
                     doc_count = collection.count()
                     logger.info(f"Collection '{collection.name}' ready with {doc_count} documents")
                     if doc_count == 0:
-                        logger.warning("Collection is empty. Run 'python ingest.py --fresh' to populate it.")
+                        logger.warning("Collection is empty. Ensure data is ingested via the external pipeline.")
                 except ValueError as e:
                     logger.warning(f"Collection validation: {str(e)}")
                     logger.warning("Queries will fail until collection is created via ingestion.")
@@ -631,6 +635,7 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
     try:
         # Get input from request
         user_input = req.get_input()
+        strict_mode = getattr(req, "strict_json", False)
         
         if not user_input or not user_input.strip():
             raise HTTPException(
@@ -641,6 +646,17 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         # Normalize input
         normalized_input = normalize_user_input(user_input)
         
+        # Apply JSON strict mode instructions if requested
+        if strict_mode:
+            normalized_input += (
+                "\n\nIMPORTANT: "
+                "You MUST return ONLY valid JSON. "
+                "Do NOT return markdown. "
+                "Do NOT return explanation. "
+                "Do NOT wrap in code blocks. "
+                "Output must be a single JSON object."
+            )
+        
         logger.info(f"[API] Processing query: {normalized_input[:100]}...")
         
         # Determine intent (just for logging/metrics if needed, but we route EVERYTHING to orchestrator)
@@ -650,7 +666,16 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         # This handles RAG, Web Search, and LLM fallback internally.
         logger.info("[API] Delegating to orchestrator")
         try:
-            result = answer_query_simple(normalized_input)
+            if is_report_request(normalized_input):
+                logger.info(f"[API] Generating detailed report for: {normalized_input[:50]}...")
+                result = generate_report(normalized_input)
+                
+                if result.get("rag_used"):
+                    result["confidence_level"] = "HIGH"
+                else:
+                    result["confidence_level"] = "LOW"
+            else:
+                result = answer_query_simple(normalized_input)
         except Exception as orchestrator_error:
             # Fallback if orchestrator crashes completely
             logger.error(f"[API] Orchestrator crashed: {orchestrator_error}", exc_info=True)
@@ -668,6 +693,35 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         answer = result.get("answer", "No answer generated.")
         answer_type = result.get("answer_type", "sagealpha_rag")
         sources = result.get("sources", [])
+        
+        # Apply strict JSON validation and repair if requested
+        if strict_mode and answer:
+            import json
+            try:
+                # Try simple parse
+                _ = json.loads(answer)
+            except json.JSONDecodeError:
+                # Attempt repair
+                try:
+                    cleaned = answer.strip()
+                    if cleaned.startswith("```json"):
+                        cleaned = cleaned[7:]
+                    elif cleaned.startswith("```"):
+                        cleaned = cleaned[3:]
+                    if cleaned.endswith("```"):
+                        cleaned = cleaned[:-3]
+                    cleaned = cleaned.strip()
+                    
+                    # Validate again
+                    _ = json.loads(cleaned)
+                    answer = cleaned
+                except Exception:
+                    # Final safety fallback
+                    logger.warning("[API] JSON Strict Mode: Failed to parse/repair LLM response. Wrapping safely.")
+                    answer = json.dumps({
+                        "response": answer,
+                        "warning": "Model returned non-strict JSON output"
+                    })
         
         # Source Formatting
         formatted_sources = []

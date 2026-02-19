@@ -100,7 +100,31 @@ class ReportGenerator:
         )
         
         self.output_parser = StrOutputParser()
-        self.collection = get_collection(create_if_missing=False)
+        
+        # Get Chroma collections
+        self.collection_names = ["dixon-technologies", "finance_documents"]
+        self.collections = []
+        self.chroma_available = False
+        
+        try:
+            for name in self.collection_names:
+                try:
+                    col = get_collection(name=name, create_if_missing=False)
+                    self.collections.append(col)
+                    logger.info(f"[REPORT] Loaded collection: {name}")
+                except Exception as e:
+                    logger.warning(f"[REPORT] Collection '{name}' unavailable: {e}")
+            
+            if self.collections:
+                self.chroma_available = True
+                logger.info("[REPORT] Chroma collections connected successfully")
+            else:
+                 logger.warning("[REPORT] No collections available — skipping fact retrieval")
+                
+        except Exception:
+            logger.warning("[REPORT] Chroma unavailable — disabling RAG")
+            self.collections = []
+            self.chroma_available = False
         
         # Setup report prompt
         self.report_template = """You are a Senior Equity Research Analyst.
@@ -139,17 +163,31 @@ Report:"""
         Returns:
             (documents, metadatas)
         """
+        if not getattr(self, "chroma_available", False):
+            logger.warning("[REPORT] Chroma disabled — skipping fact retrieval")
+            return [], []
+
         try:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=n_results,
-                include=["documents", "metadatas", "distances"]
-            )
+            all_documents = []
+            all_metadatas = []
             
-            documents = results.get("documents", [[]])[0] if results.get("documents") else []
-            metadatas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+            for col in self.collections:
+                try:
+                    results = col.query(
+                        query_texts=[query],
+                        n_results=n_results,
+                        include=["documents", "metadatas", "distances"]
+                    )
+                    
+                    docs = results.get("documents", [[]])[0] if results.get("documents") else []
+                    metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+                    
+                    all_documents.extend(docs)
+                    all_metadatas.extend(metas)
+                except Exception as e:
+                    logger.warning(f"[REPORT] Failed to retrieve from {col.name}: {e}")
             
-            return documents, metadatas
+            return all_documents, all_metadatas
         except Exception as e:
             logger.error(f"Document retrieval failed: {e}")
             return [], []
@@ -159,48 +197,80 @@ Report:"""
         Generate a long-format report.
         
         Two-phase approach:
-        1. Retrieve facts via RAG
-        2. Generate narrative via LLM
+        1. Retrieve facts via RAG (if available)
+        2. Always generate narrative via LLM
         
-        Args:
-            query: User query/request
-        
-        Returns:
-            Dict with report text and metadata
+        This function NEVER blocks due to missing documents.
         """
+
         try:
             # Phase 1: Retrieve facts
             documents, metadatas = self._retrieve_facts(query, n_results=10)
-            fact_context = build_fact_context(documents, metadatas)
-            
-            # Phase 2: Generate narrative report
+
+            rag_used = len(documents) > 0
+
+            if rag_used:
+                logger.info("[REPORT] Generating report using retrieved RAG documents")
+                fact_context = build_fact_context(documents, metadatas)
+            else:
+                logger.warning("[REPORT] No RAG documents found — switching to LLM-only mode")
+                fact_context = (
+                    "No verified internal documents available. "
+                    "Generate report using general financial knowledge, "
+                    "public market understanding, and structured investment analysis methodology."
+                )
+
+            # Phase 2: Generate report via LLM (always)
             report_text = self.report_chain.invoke({
                 "query": query,
                 "context": fact_context
             })
-            
-            # Format sources using SourceFormatter
-            formatted_sources = SourceFormatter.format_sources(metadatas, [])
-            
-            # Ensure sources are never null
-            if not formatted_sources and metadatas:
-                formatted_sources = SourceFormatter._create_fallback_sources(metadatas)
-            
+
+            # Format sources
+            formatted_sources = []
+            if rag_used:
+                formatted_sources = SourceFormatter.format_sources(metadatas, [])
+                if not formatted_sources and metadatas:
+                    formatted_sources = SourceFormatter._create_fallback_sources(metadatas)
+
             return {
                 "answer": report_text,
-                "answer_type": "sagealpha_rag",  # Reports use RAG branding
-                "sources": formatted_sources if formatted_sources else [],  # Never null
+                "answer_type": "REPORT",
+                "sources": formatted_sources,
+                "rag_used": rag_used,
+                "confidence_level": "HIGH" if rag_used else "LOW",
                 "format": "long-format"
             }
+
         except Exception as e:
-            logger.error(f"Report generation failed: {e}", exc_info=True)
-            # Fallback to shorter response
-            return {
-                "answer": f"I apologize, but I encountered an error while generating the report. Please try rephrasing your request.",
-                "answer_type": "sagealpha_rag",  # Reports use RAG branding
-                "sources": [],  # Never null
-                "format": "error"
-            }
+            logger.error(f"[REPORT] Critical failure — falling back to LLM-only: {e}", exc_info=True)
+
+            try:
+                fallback_text = self.report_chain.invoke({
+                    "query": query,
+                    "context": "Generate a professional investment research report using general financial knowledge."
+                })
+
+                return {
+                    "answer": fallback_text,
+                    "answer_type": "REPORT",
+                    "sources": [],
+                    "rag_used": False,
+                    "confidence_level": "LOW",
+                    "format": "llm_fallback"
+                }
+
+            except Exception as final_error:
+                logger.error(f"[REPORT] Complete failure: {final_error}", exc_info=True)
+
+                return {
+                    "answer": "Report generation temporarily unavailable. Please try again.",
+                    "answer_type": "REPORT",
+                    "sources": [],
+                    "rag_used": False,
+                    "confidence_level": "LOW",
+                    "format": "error"
+                }
 
 
 # Singleton instance

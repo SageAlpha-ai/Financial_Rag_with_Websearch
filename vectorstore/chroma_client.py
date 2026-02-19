@@ -223,12 +223,12 @@ def get_collection(
                 if "not found" in error_msg or "does not exist" in error_msg:
                     logger.error(f"[CHROMA] Collection '{collection_name}' does not exist")
                     logger.error(f"[CHROMA] To auto-create collections, set CHROMA_AUTO_CREATE_COLLECTION=true")
-                    logger.error(f"[CHROMA] Or run ingestion: python ingest.py --fresh")
+                    logger.error(f"[CHROMA] Or ensure the external data pipeline has created it.")
                     raise ValueError(
                         f"Chroma collection '{collection_name}' does not exist. "
                         f"Please either:\n"
                         f"  1. Set CHROMA_AUTO_CREATE_COLLECTION=true to auto-create empty collections, or\n"
-                        f"  2. Run ingestion to populate the collection: python ingest.py --fresh"
+                        f"  2. Populate the collection via the external data pipeline."
                     ) from e
                 else:
                     # Re-raise other errors
@@ -264,6 +264,14 @@ def get_chat_history_collection() -> Collection:
     )
     
     return collection
+
+
+def get_all_collections() -> list:
+    """
+    Returns all collections from current Chroma database.
+    """
+    client = get_chroma_client()
+    return client.list_collections()
 
 
 def delete_collection(name: str) -> None:

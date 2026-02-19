@@ -42,7 +42,7 @@ services:
       - key: CHROMA_DATABASE
         sync: false
       - key: CHROMA_COLLECTION_NAME
-        value: compliance
+        value: dixon-technologies
       # Optional: Auto-create Chroma collections in development
       - key: CHROMA_AUTO_CREATE_COLLECTION
         value: "true"

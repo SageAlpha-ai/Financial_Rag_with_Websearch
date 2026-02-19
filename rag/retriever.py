@@ -48,18 +48,30 @@ def retrieve_documents(
     Returns:
         Tuple of (documents, metadatas)
     """
-    collection = get_collection(collection_name, create_if_missing=False)
+    target_collections = [collection_name] if collection_name else ["dixon-technologies", "finance_documents"]
     
-    results = collection.query(
-        query_texts=[query],
-        n_results=n_results,
-        include=["documents", "metadatas"]
-    )
+    all_documents = []
+    all_metadatas = []
     
-    documents = results["documents"][0] if results["documents"] else []
-    metadatas = results["metadatas"][0] if results["metadatas"] else []
-    
-    return documents, metadatas
+    for col_name in target_collections:
+        try:
+            collection = get_collection(col_name, create_if_missing=False)
+            
+            results = collection.query(
+                query_texts=[query],
+                n_results=n_results,
+                include=["documents", "metadatas"]
+            )
+            
+            docs = results.get("documents", [[]])[0] if results.get("documents") else []
+            metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+            
+            all_documents.extend(docs)
+            all_metadatas.extend(metas)
+        except Exception as e:
+            print(f"Failed to retrieve from {col_name}: {e}")
+            
+    return all_documents, all_metadatas
 
 
 def retrieve_with_year_filter(
@@ -81,59 +93,74 @@ def retrieve_with_year_filter(
     Returns:
         Tuple of (documents, metadatas, requested_year)
     """
-    collection = get_collection(collection_name, create_if_missing=False)
+    target_collections = [collection_name] if collection_name else ["dixon-technologies", "finance_documents"]
     requested_year = extract_year_from_query(query)
     
-    if requested_year:
-        # Try year-filtered retrieval first
-        try:
-            year_results = collection.query(
-                query_texts=[query],
-                n_results=5,
-                where={"fiscal_year": requested_year},
-                include=["documents", "metadatas"]
-            )
-            year_documents = year_results["documents"][0] if year_results["documents"] else []
-            year_metadatas = year_results["metadatas"][0] if year_results["metadatas"] else []
-        except Exception:
-            year_documents = []
-            year_metadatas = []
-        
-        # Get general results too
-        general_results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas"]
-        )
-        general_documents = general_results["documents"][0] if general_results["documents"] else []
-        general_metadatas = general_results["metadatas"][0] if general_results["metadatas"] else []
-        
-        # Combine: year-specific first
-        if year_documents:
-            # Deduplicate by avoiding docs already in year_documents
-            additional_docs = []
-            additional_metas = []
-            for doc, meta in zip(general_documents, general_metadatas):
-                if doc not in year_documents:
-                    additional_docs.append(doc)
-                    additional_metas.append(meta)
-            
-            documents = year_documents + additional_docs[:5]
-            metadatas = year_metadatas + additional_metas[:5]
-            
-            print(f"[Year-aware retrieval: Found {len(year_documents)} chunks for {requested_year}]")
-        else:
-            documents = general_documents
-            metadatas = general_metadatas
-            print(f"[Year-aware retrieval: No chunks found for {requested_year}]")
-    else:
-        # No year specified, general retrieval
-        results = collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas"]
-        )
-        documents = results["documents"][0] if results["documents"] else []
-        metadatas = results["metadatas"][0] if results["metadatas"] else []
+    all_documents = []
+    all_metadatas = []
     
-    return documents, metadatas, requested_year
+    for col_name in target_collections:
+        try:
+            collection = get_collection(col_name, create_if_missing=False)
+            
+            col_docs = []
+            col_metas = []
+            
+            if requested_year:
+                # Try year-filtered retrieval first
+                try:
+                    year_results = collection.query(
+                        query_texts=[query],
+                        n_results=5,
+                        where={"fiscal_year": requested_year},
+                        include=["documents", "metadatas"]
+                    )
+                    year_documents = year_results.get("documents", [[]])[0] if year_results.get("documents") else []
+                    year_metadatas = year_results.get("metadatas", [[]])[0] if year_results.get("metadatas") else []
+                except Exception:
+                    year_documents = []
+                    year_metadatas = []
+                
+                # Get general results too
+                general_results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas"]
+                )
+                general_documents = general_results.get("documents", [[]])[0] if general_results.get("documents") else []
+                general_metadatas = general_results.get("metadatas", [[]])[0] if general_results.get("metadatas") else []
+                
+                # Combine: year-specific first
+                if year_documents:
+                    # Deduplicate by avoiding docs already in year_documents
+                    additional_docs = []
+                    additional_metas = []
+                    for doc, meta in zip(general_documents, general_metadatas):
+                        if doc not in year_documents:
+                            additional_docs.append(doc)
+                            additional_metas.append(meta)
+                    
+                    col_docs = year_documents + additional_docs[:5]
+                    col_metas = year_metas + additional_metas[:5]
+                    print(f"[{col_name}] Year-aware retrieval: Found {len(year_documents)} chunks for {requested_year}")
+                else:
+                    col_docs = general_documents
+                    col_metas = general_metadatas
+                    print(f"[{col_name}] Year-aware retrieval: No chunks found for {requested_year}")
+            else:
+                # No year specified, general retrieval
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=n_results,
+                    include=["documents", "metadatas"]
+                )
+                col_docs = results.get("documents", [[]])[0] if results.get("documents") else []
+                col_metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+            
+            all_documents.extend(col_docs)
+            all_metadatas.extend(col_metas)
+            
+        except Exception as e:
+            print(f"Failed to retrieve from {col_name}: {e}")
+            
+    return all_documents, all_metadatas, requested_year

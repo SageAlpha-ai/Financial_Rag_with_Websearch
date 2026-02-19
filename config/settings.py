@@ -70,7 +70,7 @@ class AppConfig:
     azure_openai: AzureOpenAIConfig
     azure_blob: AzureBlobConfig
     chroma_cloud: ChromaCloudConfig
-    supported_companies: List[str]
+
     enable_query_planner: bool
     enable_web_search: bool
 
@@ -115,13 +115,10 @@ def load_config() -> AppConfig:
         api_key=_get_required_env("CHROMA_API_KEY"),
         tenant=_get_required_env("CHROMA_TENANT"),
         database=_get_required_env("CHROMA_DATABASE"),
-        collection_name=_get_optional_env("CHROMA_COLLECTION_NAME", "compliance"),
+        collection_name=_get_optional_env("CHROMA_COLLECTION_NAME", "dixon-technologies"),
     )
     
-    # Supported Companies
-    supported_companies_str = _get_optional_env("SUPPORTED_COMPANIES", "")
-    supported_companies = [c.strip() for c in supported_companies_str.split(",") if c.strip()]
-    
+
     # Feature Flags
     enable_query_planner = _get_optional_env("ENABLE_QUERY_PLANNER", "false").lower() == "true"
     enable_web_search = _get_optional_env("ENABLE_WEB_SEARCH", "false").lower() == "true"
@@ -130,7 +127,6 @@ def load_config() -> AppConfig:
         azure_openai=azure_openai,
         azure_blob=azure_blob,
         chroma_cloud=chroma_cloud,
-        supported_companies=supported_companies,
         enable_query_planner=enable_query_planner,
         enable_web_search=enable_web_search,
     )
@@ -195,16 +191,7 @@ def validate_config(config: AppConfig) -> None:
     logger.info(f"  Database: {config.chroma_cloud.database}")
     logger.info(f"  Collection: {config.chroma_cloud.collection_name}")
     
-    # Supported Companies
-    logger.info("")
-    logger.info("Supported Companies:")
-    if config.supported_companies:
-        for company in config.supported_companies:
-            logger.info(f"  - {company}")
-    else:
-        logger.warning("  WARNING: No companies supported (SUPPORTED_COMPANIES is empty)")
-    
-    logger.info("")
+
     logger.info("Feature Flags:")
     logger.info(f"  Query Planner: {'ENABLED' if config.enable_query_planner else 'DISABLED'}")
     logger.info(f"  Web Search: {'ENABLED' if config.enable_web_search else 'DISABLED'}")

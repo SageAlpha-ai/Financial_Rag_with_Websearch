@@ -348,48 +348,50 @@ class LangChainOrchestrator:
             "api_version": config.azure_openai.api_version,
         }
         
-        # Only add model parameter for older models if needed
-        if "text-embedding-ada-002" in config.azure_openai.embeddings_deployment.lower():
-            embedding_kwargs["model"] = "text-embedding-ada-002"
+
         
         self.embeddings = AzureOpenAIEmbeddings(**embedding_kwargs)
         
         self.output_parser = StrOutputParser()
         
-        # Get Chroma collection
-        # Use create_if_missing=False for strict mode (will raise ValueError if missing)
-        # This allows graceful error handling in the API layer
+        # Get Chroma collections
+        # Dynamically load ALL collections from the active Chroma database
+        from vectorstore.chroma_client import get_all_collections
+
         try:
-            self.collection = get_collection(create_if_missing=False)
-        except ValueError as e:
-            # Collection doesn't exist - this is a configuration issue
-            error_msg = str(e)
-            logger.error("=" * 60)
-            logger.error("CHROMADB COLLECTION ERROR")
-            logger.error("=" * 60)
-            logger.error(error_msg)
-            logger.error("=" * 60)
-            raise RuntimeError(error_msg) from e
+            self.collections = get_all_collections()
+            self.chroma_available = len(self.collections) > 0
+            logger.info(f"[ORCHESTRATOR] Dynamically loaded {len(self.collections)} collections")
+        except Exception as e:
+            logger.warning(f"[ORCHESTRATOR] Failed to load collections: {e}")
+            self.collections = []
+            self.chroma_available = False
         
         # VERIFY ChromaDB is not empty (WARN but don't fail - allow LLM fallback)
-        doc_count = self.collection.count()
+        if self.chroma_available and self.collections:
+            total_docs = 0
+            for col in self.collections:
+                try:
+                    doc_count = col.count()
+                    total_docs += doc_count
+                    logger.info(f"Collection '{col.name}': {doc_count} documents")
+                except Exception as e:
+                    logger.warning(f"[ORCHESTRATOR] Failed to count docs in {col.name}: {e}")
+            
+            if total_docs == 0:
+                warning_msg = (
+                    "WARNING: All ChromaDB collections are EMPTY. "
+                    "No documents have been ingested. "
+                    "RAG queries will fall back to LLM-only answers. "
+                    "Ensure documents are ingested via the external data pipeline."
+                )
+                logger.warning("=" * 60)
+                logger.warning(warning_msg)
+                logger.warning("=" * 60)
+        else:
+            logger.warning("[ORCHESTRATOR] Skipping collection status check (Chroma unavailable)")
+            
         logger.info("=" * 60)
-        logger.info("CHROMADB COLLECTION STATUS")
-        logger.info("=" * 60)
-        logger.info(f"Collection name: {self.collection.name}")
-        logger.info(f"Total embeddings: {doc_count}")
-        
-        if doc_count == 0:
-            warning_msg = (
-                "WARNING: ChromaDB collection is EMPTY. "
-                "No documents have been ingested. "
-                "RAG queries will fall back to LLM-only answers. "
-                "To populate the collection, run: python ingest.py --fresh"
-            )
-            logger.warning("=" * 60)
-            logger.warning(warning_msg)
-            logger.warning("=" * 60)
-            # Don't raise - allow the app to start and use LLM fallback
         
         logger.info("=" * 60)
         
@@ -410,7 +412,13 @@ class LangChainOrchestrator:
         """Setup BM25 index from Chroma documents."""
         try:
             logger.info("Loading documents from Chroma for BM25 indexing...")
-            all_documents, all_metadatas = _load_all_documents_from_chroma(self.collection)
+            all_documents = []
+            all_metadatas = []
+            
+            for col in self.collections:
+                docs, metas = _load_all_documents_from_chroma(col)
+                all_documents.extend(docs)
+                all_metadatas.extend(metas)
             
             if not all_documents:
                 logger.warning("No documents loaded from Chroma. BM25 will be disabled.")
@@ -478,6 +486,9 @@ Answer:"""
         Uses SAME embedding model as ingestion (must match deployment name).
         Supports fiscal year filtering when query specifies a year.
         """
+        if not getattr(self, "chroma_available", False):
+            return [], []
+
         try:
             config = get_config()
             logger.info("[RETRIEVER] Embedding query using Azure OpenAI")
@@ -494,64 +505,69 @@ Answer:"""
             
             logger.info("[RETRIEVER] Searching ChromaDB using cosine similarity")
             
-            # If fiscal year specified, try year-filtered retrieval first
-            year_docs = []
-            year_metas = []
-            if requested_year:
-                try:
-                    logger.info(f"[RETRIEVER] Attempting year-filtered retrieval for {requested_year}")
-                    year_results = self.collection.query(
-                        query_embeddings=[query_embedding],
-                        n_results=5,
-                        where={"fiscal_year": requested_year},
-                        include=["documents", "metadatas", "distances"]
-                    )
-                    year_docs = year_results.get("documents", [[]])[0] if year_results.get("documents") else []
-                    year_metas = year_results.get("metadatas", [[]])[0] if year_results.get("metadatas") else []
-                    logger.info(f"[RETRIEVER] Year-filtered retrieval found {len(year_docs)} documents for {requested_year}")
-                except Exception as e:
-                    logger.warning(f"[RETRIEVER] Year-filtered retrieval failed: {e}, falling back to general retrieval")
+            # Query all collections and merge results
+            all_chroma_docs = []
+            all_chroma_metas = []
+            all_chroma_distances = [] # Keep track for logging only
             
-            # Always perform general retrieval
-            chroma_results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=5,
-                include=["documents", "metadatas", "distances"]
-            )
+            for col in self.collections:
+                # If fiscal year specified, try year-filtered retrieval first
+                year_docs = []
+                year_metas = []
+                if requested_year:
+                    try:
+                        year_results = col.query(
+                            query_embeddings=[query_embedding],
+                            n_results=5,
+                            where={"fiscal_year": requested_year},
+                            include=["documents", "metadatas", "distances"]
+                        )
+                        year_docs = year_results.get("documents", [[]])[0] if year_results.get("documents") else []
+                        year_metas = year_results.get("metadatas", [[]])[0] if year_results.get("metadatas") else []
+                    except Exception as e:
+                        logger.warning(f"[RETRIEVER] Year-filtered retrieval failed for {col.name}: {e}")
+                
+                # Always perform general retrieval
+                chroma_results = col.query(
+                    query_embeddings=[query_embedding],
+                    n_results=5,
+                    include=["documents", "metadatas", "distances"]
+                )
+                
+                chroma_docs = chroma_results.get("documents", [[]])[0] if chroma_results.get("documents") else []
+                chroma_metas = chroma_results.get("metadatas", [[]])[0] if chroma_results.get("metadatas") else []
+                chroma_distances = chroma_results.get("distances", [[]])[0] if chroma_results.get("distances") else []
+                
+                if chroma_distances:
+                    all_chroma_distances.extend(chroma_distances)
+
+                # Combine results: year-specific first, then general (deduplicated)
+                if year_docs:
+                    seen_texts = {doc.strip().lower() for doc in year_docs}
+                    additional_docs = []
+                    additional_metas = []
+                    for doc, meta in zip(chroma_docs, chroma_metas):
+                        if doc.strip().lower() not in seen_texts:
+                            additional_docs.append(doc)
+                            additional_metas.append(meta)
+                    
+                    merged_col_docs = year_docs + additional_docs
+                    merged_col_metas = year_metas + additional_metas
+                else:
+                    merged_col_docs = chroma_docs
+                    merged_col_metas = chroma_metas
+                
+                all_chroma_docs.extend(merged_col_docs)
+                all_chroma_metas.extend(merged_col_metas)
             
-            chroma_docs = chroma_results.get("documents", [[]])[0] if chroma_results.get("documents") else []
-            chroma_metas = chroma_results.get("metadatas", [[]])[0] if chroma_results.get("metadatas") else []
-            chroma_distances = chroma_results.get("distances", [[]])[0] if chroma_results.get("distances") else []
-            
-            if chroma_distances:
-                logger.info(f"[RETRIEVER] ChromaDB similarity distances: {chroma_distances[:3]}")
-                logger.info(f"[RETRIEVER] Best match distance: {min(chroma_distances) if chroma_distances else 'N/A'}")
-            
-            logger.info(f"[RETRIEVER] General ChromaDB retrieval found {len(chroma_docs)} documents")
-            
-            # Log document metadata for debugging
-            if chroma_metas:
-                logger.info(f"[RETRIEVER] Sample metadata: {chroma_metas[0] if len(chroma_metas) > 0 else 'None'}")
-                if len(chroma_metas) > 0:
-                    sample_meta = chroma_metas[0]
-                    logger.info(f"[RETRIEVER] Sample company: {sample_meta.get('company', 'N/A')}, Year: {sample_meta.get('fiscal_year', 'N/A')}")
+            chroma_docs = all_chroma_docs
+            chroma_metas = all_chroma_metas
             
             if not chroma_docs:
-                logger.warning("[RETRIEVER] No documents retrieved from ChromaDB - check if collection is populated")
-            
-            # Combine results: year-specific first, then general (deduplicated)
-            if year_docs:
-                seen_texts = {doc.strip().lower() for doc in year_docs}
-                additional_docs = []
-                additional_metas = []
-                for doc, meta in zip(chroma_docs, chroma_metas):
-                    if doc.strip().lower() not in seen_texts:
-                        additional_docs.append(doc)
-                        additional_metas.append(meta)
-                
-                chroma_docs = year_docs + additional_docs[:3]
-                chroma_metas = year_metas + additional_metas[:3]
-                logger.info(f"[RETRIEVER] Combined retrieval: {len(year_docs)} year-specific + {len(additional_docs[:3])} general = {len(chroma_docs)} total")
+                logger.warning("[RETRIEVER] No documents retrieved from any ChromaDB collection")
+            else:
+                 logger.info(f"[RETRIEVER] Retrieved {len(chroma_docs)} total documents from {len(self.collections)} collections")
+
             
             # BM25 retrieval if numeric intent detected
             bm25_docs = []
@@ -728,15 +744,28 @@ Answer:"""
             query_embedding = self.embeddings.embed_query(question)
             
             # Fast query (using default collection)
-            results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=3,
-                include=["documents", "metadatas", "distances"]
-            )
+            results_list = []
+            for col in self.collections:
+                results_list.append(col.query(
+                    query_embeddings=[query_embedding],
+                    n_results=3,
+                    include=["documents", "metadatas", "distances"]
+                ))
             
-            docs = results.get("documents", [[]])[0] if results.get("documents") else []
-            metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
-            distances = results.get("distances", [[]])[0] if results.get("distances") else []
+            # Determine success if ANY collection returned results
+            # For simplicity in this probe, we just check if ANYTHING was found
+            
+            docs = []
+            metas = []
+            distances = []
+            
+            for results in results_list:
+                d = results.get("documents", [[]])[0] if results.get("documents") else []
+                m = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+                dst = results.get("distances", [[]])[0] if results.get("distances") else []
+                docs.extend(d)
+                metas.extend(m)
+                distances.extend(dst)
             
             # Filter by relevance threshold (e.g., distance < 1.0 for cosine distance)
             # Only count as "Internal Knowledge" if reasonably close
@@ -759,49 +788,70 @@ Answer:"""
             logger.warning(f"[PROBE] Failed to probe internal knowledge: {e}")
             return []
 
-    def _plan_query(self, question: str, has_internal_knowledge: bool = False, internal_match_count: int = 0) -> Dict[str, Any]:
+    def _plan_query(
+        self,
+        question: str,
+        best_distance: Optional[float],
+        internal_doc_count: int,
+        internal_docs_found: bool
+    ) -> Dict[str, Any]:
         """
-        Evidence-Aware Planner.
+        Planner Phase (gpt-4o-mini).
         
-        Decides routing strategy based on:
-        1. Contextual signals (semantic match for RAG)
-        2. Query intent (real-time vs historical)
+        Decides routing strategy based on semantic signals and query intent.
+        
+        Signals:
+        - best_semantic_distance: Lower is better (0.0 = exact match). < 0.3 is very strong. > 0.5 is weak.
+        - internal_docs_found: Whether any documents were retrieved.
         """
         default_plan = {"mode": "rag", "reason": "Default fallback"}
         
         try:
             if not self.planner_llm:
-                 return default_plan
+                 # Fallback if no planner model configured
+                 if internal_docs_found:
+                     return {"mode": "rag", "reason": "Fallback: Internal docs found, planner disabled"}
+                 else:
+                     return {"mode": "llm", "reason": "Fallback: No docs found, planner disabled"}
 
             planner_prompt = f"""You are an intelligent AI routing engine.
 
-You must decide how to answer a query.
+You must decide how to answer a query based on semantic retrieval signals.
 
 Signals provided:
-
-- has_internal_knowledge: {has_internal_knowledge}
-- internal_match_count: {internal_match_count}
 - Query: "{question}"
+- Internal Documents Found: {internal_docs_found}
+- Count: {internal_doc_count}
+- Best Semantic Distance: {best_distance if best_distance is not None else "N/A"}
+  (Note: Distance 0.0 is exact match. < 0.4 is strong. > 0.5 is weak.)
 
 Available modes:
+- "rag"     → Use internal knowledge only. (Data-dependent query requiring specific internal evidence)
+- "web"     → Use web search only. (Real-time, news, stock price, today's data)
+- "hybrid"  → Use both internal knowledge and web. (Mixed intent, weak internal match but relevant)
+- "llm"     → Use model knowledge only. (General definition, explanation, greetings, no internal match)
 
-- "rag"     → Use internal knowledge only.
-- "web"     → Use web search only.
-- "hybrid"  → Use both internal knowledge and web.
-- "llm"     → Use model knowledge only.
+Important Reasoning Guidelines:
 
-Rules:
+1. CONCEPTUAL / DEFINITION QUERIES:
+   - If the query asks for a general explanation, definition, or concept (e.g., "What is EBITDA?", "Explain inflation", "Define revenue"), prefer "llm".
+   - Do NOT choose "rag" just because internal documents mention the term.
+   - Only choose "rag" if the question asks for SPECIFIC internal data (e.g., "What was FY2023 revenue?", "Show EBITDA margin").
 
-If strong internal semantic match exists and query is historical → prefer "rag".
+2. DATA-DEPENDENT QUERIES:
+   - If the query requires historical financial figures, company-specific metrics, or document-based evidence, prefer "rag".
+   - Strong semantic similarity is a positive signal here.
 
-If query requires current, live, today, latest, realtime info → prefer "web".
+3. REAL-TIME QUERIES:
+   - If query asks for "today", "current", "latest", "stock price", prefer "web" or "hybrid".
 
-If both internal historical data AND latest update required → choose "hybrid".
+4. MIXED:
+   - If query compares historical data with current market data, prefer "hybrid".
 
-If no retrieval required → choose "llm".
+5. FALLBACK:
+   - If no internal documents found or distance > 0.8, prefer "llm" (or "web").
 
-Return ONLY JSON:
-
+Return STRICT JSON ONLY:
 {{
   "mode": "rag" | "web" | "hybrid" | "llm",
   "reason": "short explanation"
@@ -828,7 +878,7 @@ Return ONLY JSON:
             logger.warning(f"[PLANNER] Failed. Using safe fallback. Error: {e}")
             
             # Smart Fallback logic
-            if has_internal_knowledge:
+            if internal_docs_found:
                 return {"mode": "rag", "reason": "Fallback: Internal knowledge detected"}
             else:
                 return {"mode": "llm", "reason": "Fallback: No internal knowledge detected"}
@@ -851,97 +901,76 @@ Return ONLY JSON:
             
             question_lower = question.lower()
             
-            # STEP 1: DETECT SUPPORTED COMPANY
-            matched_company = None
-            if config.supported_companies:
-                for company in config.supported_companies:
-                    if company in question_lower:
-                        matched_company = company
-                        break
-            
             # Initialize evidence buckets
             rag_docs = []
             rag_metas = []
-            web_docs = []
             distances = []
+            web_docs = []
             
-            # STEP 2: IF SUPPORTED COMPANY -> TRY SEMANTIC RAG
-            if matched_company:
-                logger.info(f"[ROUTER] Supported company detected: {matched_company}")
-                logger.info("[ROUTER] Running semantic similarity search in ChromaDB")
+            # PHASE 1: SEMANTIC PROBE
+            logger.info("[ROUTER] Phase 1: Semantic Probe across ALL collections")
+            
+            best_distance = None
+            internal_doc_count = 0
+            internal_docs_found = False
+            
+            try:
+                query_embedding = self.embeddings.embed_query(question)
                 
-                # Perform retrieval (we use existing method which handles embeddings + year filtering)
-                # Note: To get scores, we need to query collection directly or modify retriever.
-                # For simplicity and robustness, we use the raw collection query here for routing decision.
+                raw_docs = []
+                raw_metas = []
+                raw_distances = []
                 
-                try:
-                    query_embedding = self.embeddings.embed_query(question)
-                    results = self.collection.query(
+                for col in self.collections:
+                    results = col.query(
                         query_embeddings=[query_embedding],
                         n_results=5,
                         include=["documents", "metadatas", "distances"]
                     )
+                    d = results.get("documents", [[]])[0] if results.get("documents") else []
+                    m = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+                    dist = results.get("distances", [[]])[0] if results.get("distances") else []
                     
-                    raw_docs = results.get("documents", [[]])[0] if results.get("documents") else []
-                    raw_metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
-                    raw_distances = results.get("distances", [[]])[0] if results.get("distances") else []
-                    
-                    # Store for use
+                    raw_docs.extend(d)
+                    raw_metas.extend(m)
+                    raw_distances.extend(dist)
+                
+                internal_doc_count = len(raw_docs)
+                internal_docs_found = internal_doc_count > 0
+                
+                if internal_docs_found and raw_distances:
+                    best_distance = min(raw_distances)
+                    # Store purely for potential use if RAG is chosen
                     rag_docs = raw_docs
                     rag_metas = raw_metas
                     distances = raw_distances
-                    
-                    # Calculate match strength
-                    # Chroma returns L2/Cosine distance. Lower is better.
-                    # Assumption: 0.0 is exact match.
-                    # User threshold: Similarity >= 0.75.
-                    # If using Cosine Distance (range 0-1 usually, max 2): Similarity ~= 1 - Distance.
-                    # So 1 - Distance >= 0.75 => Distance <= 0.25.
-                    # We'll use a configurable threshold logic.
-                    
-                    is_strong_match = False
-                    if distances:
-                        min_distance = min(distances)
-                        logger.info(f"[ROUTER] Best semantic distance: {min_distance}")
-                        
-                        # Threshold: 0.35 is a reasonable strict cutoff for ada-002 / text-embedding-3-small
-                        # Adjusting to be roughly equivalent to 0.75 similarity
-                        if min_distance <= 0.4:
-                            is_strong_match = True
-                            logger.info(f"[ROUTER] Strong semantic match (distance {min_distance} <= 0.4)")
-                        else:
-                            logger.info(f"[ROUTER] Weak semantic match (distance {min_distance} > 0.4)")
-                    
-                except Exception as e:
-                    logger.error(f"[ROUTER] Semantic search failed: {e}")
-                    is_strong_match = False
                 
-                if is_strong_match:
-                    # RAG ONLY PATH
-                    mode = "rag"
-                    # rag_docs and rag_metas are already populated
-                else:
-                    # WEAK/NO MATCH -> HYBRID PATH
-                    mode = "hybrid"
-                    logger.info("[ROUTER] Switching to HYBRID (Web + LLM)")
-                    web_docs = self._retrieve_web_evidence(question)
+                logger.info(f"[ROUTER] Probe Results: Found {internal_doc_count} docs. Best Dist: {best_distance}")
+                
+            except Exception as e:
+                logger.error(f"[ROUTER] Semantic probe failed: {e}")
+                internal_docs_found = False
             
-            # STEP 3: UNSUPPORTED COMPANY -> WEB + LLM
-            else:
-                mode = "web"
-                logger.info("[ROUTER] Unsupported/General query -> using WEB + LLM")
-                web_docs = self._retrieve_web_evidence(question)
-
-                # Fallback to LLM only if web fails
-                if not web_docs:
-                    mode = "llm"
+            # PHASE 2: PLANNER DECISION
+            logger.info("[ROUTER] Phase 2: Planner Logic (gpt-4o-mini)")
             
-            logger.info(f"[ROUTER] Final Mode: {mode.upper()}")
+            plan = self._plan_query(
+                question=question,
+                best_distance=best_distance,
+                internal_doc_count=internal_doc_count,
+                internal_docs_found=internal_docs_found
+            )
             
-            # STEP 4: EXECUTE & SYNTHESIZE
+            mode = plan.get("mode", "rag")
+            reason = plan.get("reason", "No reason provided")
             
+            logger.info(f"[ROUTER] Planner Decision: MODE={mode.upper()} | REASON={reason}")
+            
+            # PHASE 3: EXECUTION
+            
+            # Branch 1: LLM Only
             if mode == "llm":
-                logger.info("[ROUTER] LLM-only execution")
+                logger.info("[ROUTER] Executing LLM-only path")
                 chain = get_llm_only_chain()
                 answer = chain.invoke({"question": question})
                 return {
@@ -950,15 +979,51 @@ Return ONLY JSON:
                     "sources": []
                 }
             
-            # Determine answer type string
-            if rag_docs and web_docs:
+            # Branch 2: Web Only (Treat as Hybrid but without RAG docs)
+            if mode == "web":
+                logger.info("[ROUTER] Executing Web-only path")
+                try:
+                    web_docs = self._retrieve_web_evidence(question)
+                    rag_docs = [] # Ensure empty
+                    rag_metas = []
+                except Exception as e:
+                    logger.warning(f"[ROUTER] Web retrieval failed: {e}")
+                    # Fallback to LLM if web fails
+                    chain = get_llm_only_chain()
+                    answer = chain.invoke({"question": question})
+                    return {
+                        "answer": answer,
+                        "answer_type": "sagealpha_llm",
+                        "sources": []
+                    }
+
+            # Branch 3: RAG Only (Already have docs from probe)
+            if mode == "rag":
+                logger.info("[ROUTER] Executing RAG-only path")
+                web_docs = [] # Ensure empty
+                # rag_docs populated from probe
+            
+            # Branch 4: Hybrid (RAG + Web)
+            if mode == "hybrid":
+                logger.info("[ROUTER] Executing Hybrid path")
+                try:
+                    # rag_docs already populated from probe
+                    web_docs = self._retrieve_web_evidence(question)
+                except Exception as e:
+                    logger.warning(f"[ROUTER] Web portion of hybrid failed: {e}")
+            
+            # Final Synthesis (Common for RAG, Web, Hybrid)
+            
+            # Determine answer type string for frontend
+            if mode == "hybrid":
                 answer_type = "sagealpha_hybrid_search"
-            elif rag_docs:
-                answer_type = "sagealpha_rag"
-            elif web_docs:
+            elif mode == "web":
                 answer_type = "sagealpha_ai_search"
+            elif mode == "rag":
+                answer_type = "sagealpha_rag"
             else:
                 answer_type = "llm_fallback"
+
             
             # Fuse Evidence
             fusion_result = EvidenceFusion.fuse_evidence(
@@ -971,18 +1036,66 @@ Return ONLY JSON:
             fused_context = fusion_result.get("fused_context", "")
             
             # Final Synthesis
-            system_prompt = """You are a financial AI assistant.
+            # Final Synthesis
+            system_prompt = """You are an enterprise-grade financial AI assistant.
 
-Use the following context sources to answer the user question.
+You generate answers using three possible evidence sources:
+1. Internal enterprise documents (retrieved via semantic search)
+2. Real-time web search results
+3. Your reasoning capability for structured synthesis
+
+You must follow these rules strictly:
+
+### Evidence Usage Rules
+1. Use INTERNAL DOCUMENTS only for:
+   - Historical financial figures
+   - Company-reported revenue
+   - EPS, margins, financial statements
+   - Official document-based metrics
+
+2. Use WEB SEARCH only for:
+   - Current stock price
+   - Live market data
+   - Latest market capitalization
+   - Current news
+
+3. NEVER:
+   - Estimate values using assumed P/E ratios
+   - Infer stock price from EPS unless explicitly provided
+   - Invent financial figures
+   - Perform speculative valuation math
+   - Combine unrelated web results
+   - Use weak or informal sources (forums, Reddit, speculative blogs)
+
+4. If live data is not clearly available from web sources:
+   - State that current market data could not be verified
+   - Do NOT fabricate estimates
+
+### Hybrid Query Handling
+If the query requires both historical and current data:
+1. Present internal historical data first.
+2. Present verified current data second.
+3. Provide structured comparison and analytical interpretation.
+4. Keep reasoning grounded in provided evidence only.
+
+### Accuracy & Integrity Rules
+- Only use numbers explicitly present in the provided context.
+- If multiple web sources differ, present a reasonable range.
+- Do not speculate.
+- Do not project future performance unless explicitly requested.
+- Do not mention RAG, Web Search, or system internals.
+
+### Output Style
+- Professional tone
+- Clear section headers
+- Structured formatting
+- Tables only when helpful
+- No emojis
+- No casual phrasing
+- No internal system references
 
 CONTEXT:
 {context}
-
-Guidelines:
-1. Synthesize information from the provided context.
-2. If web data is more recent (e.g., stock price), prioritize it.
-3. If internal documents provide specific details, prioritize them.
-4. If no context is provided, answer using your general knowledge but mention that no specific documents were found.
 
 Question:
 {question}
@@ -990,8 +1103,7 @@ Question:
 Answer:"""
 
             generation_prompt = ChatPromptTemplate.from_messages([
-                ("system", system_prompt),
-                ("user", "{question}")
+                ("user", system_prompt)
             ])
             
             final_context = fused_context if fused_context else "No specific documents found. Answer based on general knowledge."
@@ -1026,7 +1138,6 @@ Answer:"""
 
 # Singleton instance
 _orchestrator: Optional[LangChainOrchestrator] = None
-_orchestrator_error: Optional[str] = None
 
 
 def get_llm_only_chain():
@@ -1070,37 +1181,33 @@ Answer:"""
 
 def get_orchestrator() -> LangChainOrchestrator:
     """Get singleton orchestrator instance."""
-    global _orchestrator, _orchestrator_error
+    global _orchestrator
     
     if _orchestrator is not None:
         return _orchestrator
-    
-    if _orchestrator_error is not None:
-        raise RuntimeError(f"Orchestrator initialization failed previously: {_orchestrator_error}")
     
     try:
         logger.info("[ORCHESTRATOR] Initializing LangChain orchestrator...")
         _orchestrator = LangChainOrchestrator()
         logger.info("[ORCHESTRATOR] Orchestrator initialized successfully")
         return _orchestrator
-    except RuntimeError as e:
-        # ChromaDB empty or fatal errors
-        error_msg = str(e)
-        _orchestrator_error = error_msg
-        logger.error(f"[ORCHESTRATOR] Initialization failed: {error_msg}")
-        raise
-    except ValueError as e:
-        # Configuration errors
-        error_msg = str(e)
-        _orchestrator_error = error_msg
-        logger.error(f"[ORCHESTRATOR] Configuration error: {error_msg}")
-        raise
     except Exception as e:
-        # Other initialization errors
-        error_msg = str(e)
-        _orchestrator_error = error_msg
-        logger.error(f"[ORCHESTRATOR] Unexpected initialization error: {error_msg}", exc_info=True)
-        raise RuntimeError(f"Failed to initialize orchestrator: {error_msg}") from e
+        logger.warning(f"[ORCHESTRATOR] Initialization issue: {e}")
+        logger.warning("[ORCHESTRATOR] Falling back to LLM-only mode")
+        
+        class LLMOnlyOrchestrator:
+            def answer_query(self, question: str):
+                from rag.langchain_orchestrator import get_llm_only_chain
+                chain = get_llm_only_chain()
+                answer = chain.invoke({"question": question})
+                return {
+                    "answer": answer,
+                    "answer_type": "llm_fallback",
+                    "sources": []
+                }
+        
+        _orchestrator = LLMOnlyOrchestrator()
+        return _orchestrator
 
 
 def answer_query_simple(question: str) -> Dict[str, Any]:
