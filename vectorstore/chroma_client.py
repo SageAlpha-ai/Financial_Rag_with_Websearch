@@ -39,6 +39,16 @@ def get_chroma_client() -> ClientAPI:
         return _client
     
     import os
+    
+    import chromadb
+    major_version = int(chromadb.__version__.split(".")[0])
+    minor_version = int(chromadb.__version__.split(".")[1])
+
+    if major_version == 0 and minor_version < 6:
+        raise RuntimeError(
+            f"Incompatible ChromaDB version detected: {chromadb.__version__}. "
+            f"Chroma Cloud requires >= 0.6.5 for stable v2 API support."
+        )
     config = get_config().chroma_cloud
     
     # Validate API key is present
@@ -268,10 +278,40 @@ def get_chat_history_collection() -> Collection:
 
 def get_all_collections() -> list:
     """
-    Returns all collections from current Chroma database.
+    Returns all collection objects from current Chroma database.
+    Safe for Chroma 0.6.x CloudClient.
     """
     client = get_chroma_client()
-    return client.list_collections()
+
+    try:
+        collections = client.list_collections()
+
+        # Ensure returned objects are valid Collection instances
+        valid_collections = []
+
+        for col in collections:
+            try:
+                # In 0.6.x list_collections returns Collection objects
+                name = getattr(col, "name", None)
+                if not name:
+                    continue
+
+                collection_obj = client.get_collection(name=name)
+                valid_collections.append(collection_obj)
+
+            except Exception as inner_error:
+                print(f"Skipping invalid collection: {inner_error}")
+                continue
+
+        return valid_collections
+
+    except Exception as e:
+        import chromadb
+        raise RuntimeError(
+            f"Failed to list collections from Chroma Cloud. "
+            f"Chroma version: {chromadb.__version__}. "
+            f"Error: {str(e)}"
+        ) from e
 
 
 def delete_collection(name: str) -> None:

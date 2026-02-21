@@ -1,0 +1,107 @@
+2026-02-19 23:23:40,336 - rag.langchain_orchestrator - INFO - [ORCHESTRATOR] Planner LLM initialized: gpt-4o-mini
+2026-02-19 23:23:41,987 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/auth/identity "HTTP/1.1 200 OK"
+2026-02-19 23:23:43,170 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea "HTTP/1.1 200 OK"
+2026-02-19 23:23:43,705 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev "HTTP/1.1 200 OK"
+2026-02-19 23:23:43,986 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/heartbeat "HTTP/1.1 200 OK"
+2026-02-19 23:23:44,253 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections "HTTP/1.1 200 OK"
+2026-02-19 23:23:44,261 - rag.langchain_orchestrator - INFO - [ORCHESTRATOR] Dynamically loaded 2 collections
+2026-02-19 23:23:44,523 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/b98015a4-1452-400a-8049-f075e51bc745/count "HTTP/1.1 200 OK"
+2026-02-19 23:23:44,523 - rag.langchain_orchestrator - INFO - Collection 'finance_documents': 6705 documents
+2026-02-19 23:23:44,944 - httpx - INFO - HTTP Request: GET https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/3836659c-72e6-483c-8597-726377d6dd0c/count "HTTP/1.1 200 OK"
+2026-02-19 23:23:44,944 - rag.langchain_orchestrator - INFO - Collection 'dixon-technologies': 438 documents
+2026-02-19 23:23:44,944 - rag.langchain_orchestrator - INFO - ============================================================
+2026-02-19 23:23:44,944 - rag.langchain_orchestrator - INFO - ============================================================
+2026-02-19 23:23:44,944 - rag.langchain_orchestrator - INFO - Loading documents from Chroma for BM25 indexing...
+2026-02-19 23:23:45,298 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/b98015a4-1452-400a-8049-f075e51bc745/get "HTTP/1.1 200 OK"
+2026-02-19 23:23:47,614 - rag.langchain_orchestrator - INFO - Loaded 300 documents from Chroma for BM25 indexing
+2026-02-19 23:23:47,885 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/3836659c-72e6-483c-8597-726377d6dd0c/get "HTTP/1.1 200 OK"
+2026-02-19 23:23:52,454 - rag.langchain_orchestrator - INFO - Loaded 300 documents from Chroma for BM25 indexing
+2026-02-19 23:23:52,454 - rag.langchain_orchestrator - INFO - Initializing BM25 index with 600 documents...
+2026-02-19 23:23:52,471 - rag.langchain_orchestrator - INFO - BM25 index initialized successfully
+2026-02-19 23:23:52,471 - rag.web_search - INFO - Web search engine initialized with SerpApi
+2026-02-19 23:23:52,472 - rag.temp_storage - INFO - [TEMP_STORAGE] Initialized with base_dir=C:\Users\MANGES~1\AppData\Local\Temp\rag_web_docs, TTL=24h
+2026-02-19 23:23:52,908 - rag.langchain_orchestrator - INFO - [ORCHESTRATOR] IntentExtractor initialized
+2026-02-19 23:23:52,908 - rag.langchain_orchestrator - INFO - [QUERY] Processing query
+2026-02-19 23:23:52,908 - rag.langchain_orchestrator - INFO - [QUERY] Query text: Compare FY2023 revenue and current stock price
+2026-02-19 23:23:55,497 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:23:55,507 - rag.langchain_orchestrator - INFO - [INTENT] {'query_type': 'comparison', 'company': None, 'fiscal_year': '2023', 'metrics': ['revenue', 'stock price'], 'requires_realtime': True, 'requires_internal_docs': False, 'requires_web': True, 'format': 'short', 'ambiguity': 'company_missing'}
+2026-02-19 23:23:55,507 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 1: Semantic Probe across ALL collections
+2026-02-19 23:23:56,752 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:00,615 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/b98015a4-1452-400a-8049-f075e51bc745/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:01,598 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/3836659c-72e6-483c-8597-726377d6dd0c/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - [ROUTER] Probe Results: Found 10 docs. Best Dist: 0.4723416
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 2: Deterministic Routing
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - 
+[SIGNALS]
+internal_doc_count: 10
+best_distance: 0.4723416
+requires_web: True
+requires_internal_docs: False
+strong_internal: True
+
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - [ROUTER] Deterministic Mode: HYBRID
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - [ROUTER] Executing Hybrid path
+2026-02-19 23:24:01,599 - rag.langchain_orchestrator - INFO - [WEB_SEARCH] No company name found in query, using full query for general search
+2026-02-19 23:24:01,599 - rag.web_search - INFO - [WEB_SEARCH] Performing general search for: Compare FY2023 revenue and current stock price
+2026-02-19 23:24:07,498 - rag.web_search - INFO - [WEB_SEARCH] Found 5 general results
+2026-02-19 23:24:07,498 - rag.evidence_fusion - INFO - [FUSION] Fusing evidence: 10 RAG docs, 5 web docs
+2026-02-19 23:24:07,498 - rag.evidence_fusion - INFO - [FUSION] Evidence fused: priority=web_official, conflicts=0
+2026-02-19 23:24:07,498 - rag.langchain_orchestrator - INFO - [GENERATOR] Generating final answer...
+2026-02-19 23:24:13,830 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-5-chat/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:13,837 - rag.langchain_orchestrator - INFO - [QUERY] Processing query
+2026-02-19 23:24:13,837 - rag.langchain_orchestrator - INFO - [QUERY] Query text: What is EBITDA?
+2026-02-19 23:24:16,041 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:16,047 - rag.langchain_orchestrator - INFO - [INTENT] {'query_type': 'definition', 'company': None, 'fiscal_year': None, 'metrics': [], 'requires_realtime': False, 'requires_internal_docs': False, 'requires_web': True, 'format': 'short', 'ambiguity': 'company_missing'}
+2026-02-19 23:24:16,047 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 1: Semantic Probe across ALL collections
+2026-02-19 23:24:17,465 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:18,495 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/b98015a4-1452-400a-8049-f075e51bc745/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:19,451 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/3836659c-72e6-483c-8597-726377d6dd0c/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - [ROUTER] Probe Results: Found 10 docs. Best Dist: 0.6501878
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 2: Deterministic Routing
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - 
+[SIGNALS]
+internal_doc_count: 10
+best_distance: 0.6501878
+requires_web: True
+requires_internal_docs: False
+strong_internal: False
+
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - [ROUTER] Deterministic Mode: WEB
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - [ROUTER] Executing Web-only path
+2026-02-19 23:24:19,451 - rag.langchain_orchestrator - INFO - [WEB_SEARCH] No company name found in query, using full query for general search
+2026-02-19 23:24:19,451 - rag.web_search - INFO - [WEB_SEARCH] Performing general search for: What is EBITDA?
+2026-02-19 23:24:21,052 - rag.web_search - INFO - [WEB_SEARCH] Found 3 general results
+2026-02-19 23:24:21,052 - rag.evidence_fusion - INFO - [FUSION] Fusing evidence: 0 RAG docs, 3 web docs
+2026-02-19 23:24:21,052 - rag.evidence_fusion - INFO - [FUSION] Evidence fused: priority=web_official, conflicts=0
+2026-02-19 23:24:21,052 - rag.langchain_orchestrator - INFO - [GENERATOR] Generating final answer...
+2026-02-19 23:24:26,621 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-5-chat/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:26,623 - rag.langchain_orchestrator - INFO - [QUERY] Processing query
+2026-02-19 23:24:26,623 - rag.langchain_orchestrator - INFO - [QUERY] Query text: What was Dixon revenue in FY2022?
+2026-02-19 23:24:29,108 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:29,111 - rag.langchain_orchestrator - INFO - [INTENT] {'query_type': 'historical_data', 'company': 'Dixon', 'fiscal_year': '2022', 'metrics': ['revenue'], 'requires_realtime': False, 'requires_internal_docs': False, 'requires_web': True, 'format': 'short', 'ambiguity': None}
+2026-02-19 23:24:29,111 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 1: Semantic Probe across ALL collections
+2026-02-19 23:24:30,490 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2024-12-01-preview "HTTP/1.1 200 OK"
+2026-02-19 23:24:30,784 - rag.langchain_orchestrator - INFO - [METADATA_FILTER] {'$or': [{'company_name': 'Dixon'}, {'company': 'Dixon'}]}
+2026-02-19 23:24:30,784 - rag.langchain_orchestrator - INFO - [COLLECTION_QUERY] Using filter for collection: finance_documents
+2026-02-19 23:24:31,519 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/b98015a4-1452-400a-8049-f075e51bc745/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:31,519 - rag.langchain_orchestrator - INFO - [COLLECTION_QUERY] Using filter for collection: dixon-technologies
+2026-02-19 23:24:32,134 - httpx - INFO - HTTP Request: POST https://api.trychroma.com/api/v2/tenants/78953c37-b2e5-425f-a3b1-87b55fa592ea/databases/Dev/collections/3836659c-72e6-483c-8597-726377d6dd0c/query "HTTP/1.1 200 OK"
+2026-02-19 23:24:32,134 - rag.langchain_orchestrator - INFO - [ROUTER] Probe Results: Found 0 docs. Best Dist: None
+2026-02-19 23:24:32,134 - rag.langchain_orchestrator - INFO - [ROUTER] Phase 2: Deterministic Routing
+2026-02-19 23:24:32,136 - rag.langchain_orchestrator - INFO - 
+[SIGNALS]
+internal_doc_count: 0
+best_distance: None
+requires_web: True
+requires_internal_docs: False
+strong_internal: False
+
+2026-02-19 23:24:32,136 - rag.langchain_orchestrator - INFO - [ROUTER] Deterministic Mode: WEB
+2026-02-19 23:24:32,136 - rag.langchain_orchestrator - INFO - [ROUTER] Executing Web-only path
+2026-02-19 23:24:32,136 - rag.langchain_orchestrator - INFO - [WEB_SEARCH] No company name found in query, using full query for general search
+2026-02-19 23:24:32,136 - rag.web_search - INFO - [WEB_SEARCH] Performing general search for: What was Dixon revenue in FY2022?
+2026-02-19 23:24:34,574 - rag.web_search - INFO - [WEB_SEARCH] Found 5 general results
+2026-02-19 23:24:34,575 - rag.evidence_fusion - INFO - [FUSION] Fusing evidence: 0 RAG docs, 5 web docs
+2026-02-19 23:24:34,575 - rag.evidence_fusion - INFO - [FUSION] Evidence fused: priority=web_official, conflicts=0
+2026-02-19 23:24:34,575 - rag.langchain_orchestrator - INFO - [GENERATOR] Generating final answer...
+2026-02-19 23:24:38,460 - httpx - INFO - HTTP Request: POST https://final-openai-api.openai.azure.com/openai/deployments/gpt-5-chat/chat/completions?api-version=2024-12-01-preview "HTTP/1.1 200 OK"

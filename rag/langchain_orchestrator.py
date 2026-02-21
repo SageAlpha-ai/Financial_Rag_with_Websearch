@@ -35,6 +35,7 @@ from rag.evidence_fusion import EvidenceFusion
 from rag.source_formatter import SourceFormatter
 from rag.company_validator import CompanyValidator
 from rag.query_classifier import QueryClassifier
+from rag.intent_extractor import IntentExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +316,9 @@ class LangChainOrchestrator:
         """Initialize LangChain components and verify ChromaDB is not empty."""
         config = get_config()
         
+        import chromadb
+        logger.info(f"[CHROMA_VERSION] {chromadb.__version__}")
+        
         # Azure OpenAI LLM
         self.llm = AzureChatOpenAI(
             azure_endpoint=config.azure_openai.endpoint,
@@ -407,6 +411,14 @@ class LangChainOrchestrator:
         
         # Setup prompts and chains
         self._setup_chains()
+
+        # Initialize Intent Extractor (Phase 1: Observation Mode)
+        try:
+             self.intent_extractor = IntentExtractor()
+             logger.info("[ORCHESTRATOR] IntentExtractor initialized")
+        except Exception as e:
+             logger.warning(f"[ORCHESTRATOR] Failed to initialize IntentExtractor: {e}")
+             self.intent_extractor = None
     
     def _setup_retrievers(self):
         """Setup BM25 index from Chroma documents."""
@@ -432,6 +444,25 @@ class LangChainOrchestrator:
             logger.error(f"Failed to setup BM25 index: {e}", exc_info=True)
             self.bm25_index = None
     
+    def _build_company_filter(self, intent: Any) -> Optional[Dict[str, Any]]:
+        """
+        Build strict metadata filter using exact match.
+        Chroma v2 safe.
+        """
+        if not intent or not intent.company:
+            logger.info("[METADATA_FILTER] None (no company detected)")
+            return None
+
+        company = intent.company.strip()
+        logger.info(f"[METADATA_FILTER] Exact match filter for company: {company}")
+
+        return {
+            "$or": [
+                {"company_name": {"$eq": company}},
+                {"company": {"$eq": company}}
+            ]
+        }
+
     def _setup_chains(self):
         """Setup LangChain prompts and LCEL chains."""
         
@@ -788,6 +819,89 @@ Answer:"""
             logger.warning(f"[PROBE] Failed to probe internal knowledge: {e}")
             return []
 
+    def _determine_mode(self, intent: Any, internal_doc_count: int, best_distance: Optional[float]) -> str:
+        """
+        Deterministic mode selection based on strict Policy Matrix.
+        
+        POLICY:
+        1) definition: None company -> llm; Else -> (strong_internal -> rag) elif requires_web -> web else llm
+        2) historical_data: strong_internal -> rag else web
+        3) realtime_data: requires_realtime -> web else llm
+        4) comparison: strong_internal & requires_web -> hybrid; strong_internal -> rag; else web
+        5) unknown: None company -> llm; strong_internal -> rag else web
+        """
+        # Default fallback
+        if not intent:
+            if internal_doc_count > 0 and best_distance is not None and best_distance < 0.55:
+                return "rag"
+            else:
+                return "llm"
+
+        strong_internal = (
+            internal_doc_count > 0 and 
+            best_distance is not None and 
+            best_distance < 0.55
+        )
+        
+        mode = "llm" # Default safety
+        
+        # Policy 1: Definition
+        if intent.query_type == "definition":
+            if not intent.company:
+                mode = "llm"
+            else:
+                if strong_internal:
+                    mode = "rag"
+                elif intent.requires_web:
+                    mode = "web"
+                else:
+                    mode = "llm"
+
+        # Policy 2: Historical Data
+        elif intent.query_type == "historical_data":
+            if strong_internal:
+                mode = "rag"
+            else:
+                mode = "web"
+
+        # Policy 3: Realtime Data
+        elif intent.query_type == "realtime_data":
+            if intent.requires_realtime:
+                mode = "web"
+            else:
+                mode = "llm"
+
+        # Policy 4: Comparison
+        elif intent.query_type == "comparison":
+            if strong_internal and intent.requires_web:
+                mode = "hybrid"
+            elif strong_internal:
+                mode = "rag"
+            else:
+                mode = "web"
+
+        # Policy 5: Unknown / General
+        else: # includes 'unknown' and 'report' (treat report as unknown/hybrid dependent on signals)
+            # Special case for explicit 'report' type if not handled elsewhere, 
+            # usually reports fall into historical/comparison, but if 'report':
+            if intent.query_type == "report":
+                 if strong_internal and intent.requires_web:
+                     mode = "hybrid"
+                 elif strong_internal:
+                     mode = "rag"
+                 else:
+                     mode = "web"
+            elif not intent.company:
+                mode = "llm"
+            else:
+                if strong_internal:
+                    mode = "rag"
+                else:
+                    mode = "web"
+
+        logger.info(f"[ROUTER_POLICY] query_type={intent.query_type}, company={intent.company}, strong_internal={strong_internal}")
+        return mode
+
     def _plan_query(
         self,
         question: str,
@@ -901,6 +1015,18 @@ Return STRICT JSON ONLY:
             
             question_lower = question.lower()
             
+            # Initialize return variables
+            intent = None
+            fused_context = ""
+
+            # PHASE 0: INTENT EXTRACTION (Log Only)
+            if self.intent_extractor:
+                try:
+                    intent = self.intent_extractor.extract(question)
+                    logger.info(f"[INTENT] {intent.dict()}")
+                except Exception as e:
+                    logger.warning(f"[INTENT] Extraction failed: {e}")
+            
             # Initialize evidence buckets
             rag_docs = []
             rag_metas = []
@@ -921,19 +1047,40 @@ Return STRICT JSON ONLY:
                 raw_metas = []
                 raw_distances = []
                 
+                # Build metadata filter for company isolation
+                where_filter = self._build_company_filter(intent)
+                
                 for col in self.collections:
-                    results = col.query(
-                        query_embeddings=[query_embedding],
-                        n_results=5,
-                        include=["documents", "metadatas", "distances"]
-                    )
-                    d = results.get("documents", [[]])[0] if results.get("documents") else []
-                    m = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
-                    dist = results.get("distances", [[]])[0] if results.get("distances") else []
-                    
-                    raw_docs.extend(d)
-                    raw_metas.extend(m)
-                    raw_distances.extend(dist)
+                    try:
+                        if where_filter:
+                            logger.info(f"[COLLECTION_QUERY] Using filter for collection: {col.name}")
+                            results = col.query(
+                                query_embeddings=[query_embedding],
+                                n_results=5,
+                                where=where_filter,
+                                include=["documents", "metadatas", "distances"]
+                            )
+                        else:
+                            results = col.query(
+                                query_embeddings=[query_embedding],
+                                n_results=5,
+                                include=["documents", "metadatas", "distances"]
+                            )
+                        
+                        d = results.get("documents", [[]])[0] if results.get("documents") else []
+                        m = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+                        dist = results.get("distances", [[]])[0] if results.get("distances") else []
+
+                        if m:
+                            logger.info(f"[DEBUG_SAMPLE_METADATA] {m[0]}")
+                        
+                        raw_docs.extend(d)
+                        raw_metas.extend(m)
+                        raw_distances.extend(dist)
+
+                    except Exception as e:
+                        logger.error(f"[PROBE_ERROR] Failed to query collection {col.name}: {e}")
+                        continue
                 
                 internal_doc_count = len(raw_docs)
                 internal_docs_found = internal_doc_count > 0
@@ -951,20 +1098,18 @@ Return STRICT JSON ONLY:
                 logger.error(f"[ROUTER] Semantic probe failed: {e}")
                 internal_docs_found = False
             
-            # PHASE 2: PLANNER DECISION
-            logger.info("[ROUTER] Phase 2: Planner Logic (gpt-4o-mini)")
+            # PHASE 2: DETERMINISTIC ROUTING
+            logger.info("[ROUTER] Phase 2: Deterministic Routing")
             
-            plan = self._plan_query(
-                question=question,
-                best_distance=best_distance,
+            mode = self._determine_mode(
+                intent=intent,
                 internal_doc_count=internal_doc_count,
-                internal_docs_found=internal_docs_found
+                best_distance=best_distance
             )
             
-            mode = plan.get("mode", "rag")
-            reason = plan.get("reason", "No reason provided")
+            reason = "Determined by strict routing rules based on intent and semantic probe."
             
-            logger.info(f"[ROUTER] Planner Decision: MODE={mode.upper()} | REASON={reason}")
+            logger.info(f"[ROUTER] Deterministic Mode: {mode.upper()}")
             
             # PHASE 3: EXECUTION
             
@@ -976,7 +1121,9 @@ Return STRICT JSON ONLY:
                 return {
                     "answer": answer,
                     "answer_type": "sagealpha_llm",
-                    "sources": []
+                    "sources": [],
+                    "intent": intent.dict() if intent else None,
+                    "context": "General Knowledge (LLM Only)"
                 }
             
             # Branch 2: Web Only (Treat as Hybrid but without RAG docs)
@@ -994,7 +1141,9 @@ Return STRICT JSON ONLY:
                     return {
                         "answer": answer,
                         "answer_type": "sagealpha_llm",
-                        "sources": []
+                        "sources": [],
+                        "intent": intent.dict() if intent else None,
+                        "context": "General Knowledge (Web Search Failed)"
                     }
 
             # Branch 3: RAG Only (Already have docs from probe)
@@ -1122,7 +1271,9 @@ Answer:"""
             return {
                 "answer": answer,
                 "answer_type": answer_type,
-                "sources": formatted_sources if formatted_sources else []
+                "sources": formatted_sources if formatted_sources else [],
+                "intent": intent.dict() if intent else None,
+                "context": final_context
             }
 
         except Exception as e:

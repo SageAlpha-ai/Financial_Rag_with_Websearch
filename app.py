@@ -32,7 +32,7 @@ from config.settings import get_config, validate_config
 # LangChain orchestration replaces manual routing
 from rag.langchain_orchestrator import answer_query_simple
 # Report generation for long-format reports
-from rag.report_generator import is_report_request, generate_report
+from rag.report_generator import generate_report
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -666,16 +666,28 @@ async def _process_query(req: QueryRequest) -> QueryResponse:
         # This handles RAG, Web Search, and LLM fallback internally.
         logger.info("[API] Delegating to orchestrator")
         try:
-            if is_report_request(normalized_input):
-                logger.info(f"[API] Generating detailed report for: {normalized_input[:50]}...")
-                result = generate_report(normalized_input)
+            # Step 1: Get structured answer & context from orchestrator
+            result = answer_query_simple(normalized_input)
+            
+            # Step 2: Check for Report Intent
+            # If intent explicitly asks for long format/report, we upgrade the answer
+            intent = result.get("intent", {})
+            
+            if intent and (intent.get("format") == "long" or intent.get("query_type") == "report"):
+                logger.info("[API] Detected report intent - Upgrading to Report Generator")
                 
-                if result.get("rag_used"):
-                    result["confidence_level"] = "HIGH"
-                else:
-                    result["confidence_level"] = "LOW"
-            else:
-                result = answer_query_simple(normalized_input)
+                # Use the context retrieved by orchestrator to generate full report
+                report_result = generate_report(
+                    query=normalized_input, 
+                    context=result.get("context", ""),
+                    sources=result.get("sources", [])
+                )
+                
+                # Override result with report content
+                result["answer"] = report_result["answer"]
+                result["answer_type"] = "REPORT"
+                # Keep sources from orchestrator (already passed to report_result, but ensure consistency)
+                
         except Exception as orchestrator_error:
             # Fallback if orchestrator crashes completely
             logger.error(f"[API] Orchestrator crashed: {orchestrator_error}", exc_info=True)
